@@ -284,6 +284,61 @@
     margin: 0 auto 14px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ====== RESPONSIVE: tablet & mobile ====== */
+  /* Tablet: ≤900px */
+  @media (max-width: 900px) {
+    .container { padding: 16px 14px 80px; }
+    .topbar { padding: 10px 14px; gap: 8px; flex-wrap: wrap; }
+    .topbar h1 { font-size: 14px; flex-basis: 100%; order: -1; }
+    .topbar .save-status { font-size: 11px; }
+    .nav { padding: 0 8px; top: 90px; overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; }
+    .nav button { white-space: nowrap; padding: 8px 10px; font-size: 12px; }
+    .h1-blue { font-size: 18px; padding: 10px 14px; margin: 24px 0 12px; }
+    .h2-blue { font-size: 15px; }
+    .btn { padding: 7px 12px; font-size: 13px; }
+    .ftbl { font-size: 12px; }
+    .ftbl th, .ftbl td { padding: 4px 6px; }
+    .screen-container { padding: 16px 14px 80px; }
+    .list-card { padding: 14px 14px; }
+    .list-card .icon { font-size: 22px; }
+    .list-card .title { font-size: 14px; }
+    .user-bar { padding: 8px 14px; gap: 8px; flex-wrap: wrap; }
+    .user-bar .user-info { font-size: 12px; flex-basis: 100%; }
+  }
+  /* Phone: ≤640px — wrap tables horizontally where unavoidable */
+  @media (max-width: 640px) {
+    body { line-height: 1.4; }
+    .container { padding: 12px 10px 80px; }
+    .topbar { padding: 8px 10px; }
+    .topbar h1 { font-size: 13px; }
+    .nav { top: 86px; padding: 0 4px; }
+    .nav button { padding: 7px 8px; font-size: 11px; }
+    .h1-blue { font-size: 16px; padding: 10px 12px; }
+    .h2-blue { font-size: 14px; }
+    .stage-goal { font-size: 12px; padding: 8px 10px; }
+    .hint, .Hint { font-size: 11px; }
+    /* Wide tables that have many columns get horizontal scroll */
+    .scroll-table { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -10px; padding: 0 10px; }
+    .scroll-table .ftbl { min-width: 720px; }
+    .ftbl input, .ftbl textarea { font-size: 12px; padding: 3px 5px; }
+    .ftbl th, .ftbl td { padding: 3px 4px; font-size: 11px; }
+    .list-card { padding: 12px 12px; gap: 8px; }
+    .list-card .actions { flex-wrap: wrap; }
+    .list-card .actions button { font-size: 11px; padding: 5px 8px; }
+    .btn { padding: 6px 10px; font-size: 12px; }
+    .modal-box { padding: 20px; }
+    .modal-box h2 { font-size: 16px; }
+    .progress-bar { height: 8px; }
+    /* Touch-friendly inputs */
+    input.cell, textarea.cell, input.cell[type=number] { min-height: 32px; }
+  }
+  /* Make sure inputs don't zoom on iOS focus */
+  @media (max-width: 900px) {
+    input, textarea, select { font-size: 16px !important; }
+    /* Override the smaller font sizes above only for cell inputs which are dense */
+    .ftbl input.cell, .ftbl textarea.cell { font-size: 13px !important; }
+  }
 </style>
 </head>
 <body>
@@ -883,12 +938,34 @@ async function clearStorage() {
     catch (e) { /* ignore */ }
 }
 function deepMerge(target, source) {
+    // ARRAY target: always preserve template length, fill missing with template
     if (Array.isArray(target)) {
-        return Array.isArray(source) ? source : target;
+        const result = target.slice(); // start with template (preserves length)
+        // Normalize source: Firebase may store sparse arrays as objects {0:..., 3:...}
+        let sourceItems = null;
+        if (Array.isArray(source)) {
+            sourceItems = source;
+        } else if (source !== null && typeof source === 'object') {
+            sourceItems = [];
+            for (const k of Object.keys(source)) {
+                const idx = parseInt(k, 10);
+                if (!isNaN(idx) && idx >= 0) sourceItems[idx] = source[k];
+            }
+        }
+        if (sourceItems) {
+            for (let i = 0; i < result.length; i++) {
+                if (sourceItems[i] !== undefined && sourceItems[i] !== null) {
+                    result[i] = deepMerge(target[i], sourceItems[i]);
+                }
+                // else: keep template default for that slot
+            }
+        }
+        return result;
     }
+    // OBJECT target
     if (typeof target === 'object' && target !== null) {
         const result = { ...target };
-        if (typeof source === 'object' && source !== null) {
+        if (typeof source === 'object' && source !== null && !Array.isArray(source)) {
             for (const k in source) {
                 if (k in target)
                     result[k] = deepMerge(target[k], source[k]);
@@ -898,7 +975,8 @@ function deepMerge(target, source) {
         }
         return result;
     }
-    return source !== undefined ? source : target;
+    // PRIMITIVE
+    return (source !== undefined && source !== null) ? source : target;
 }
 // Immutable update helper for nested paths
 function update(obj, path, value) {
@@ -1741,6 +1819,7 @@ function ExpA({ data, set }) {
                     React.createElement(TextArea, { value: s, onChange: v => set(['part3', 'expA', 'steps', i], v) }))))))),
         React.createElement(BulletH, null, "\uC2E4\uD5D8 \uB370\uC774\uD130 \u2014 \uC2DC\uAC04\uC5D0 \uB530\uB978 \uC628\uB3C4 \uBCC0\uD654 (\uB2E8\uC704: \u2103)"),
         React.createElement(Hint, null, "\uB0C9\uAC01\uC695(\uC5BC\uC74C+\uC18C\uAE08)\uC5D0 \uC6A9\uC561\uC744 \uB2F4\uADF8\uACE0 60\uCD08(1\uBD84) \uAC04\uACA9\uC73C\uB85C \uC628\uB3C4\uB97C \uAE30\uB85D. \uACFC\uB0C9\uAC01 \uAD6C\uAC04\uACFC \uC5B4\uB294\uC810 \uD3C9\uD0C4 \uAD6C\uAC04\uC744 \uC798 \uAD00\uCC30\uD558\uC790."),
+        React.createElement("div", { className: "scroll-table" },
         React.createElement("table", { className: "ftbl" },
             React.createElement("colgroup", null,
                 React.createElement("col", { style: { width: '160px' } }),
@@ -1767,7 +1846,7 @@ function ExpA({ data, set }) {
                             k),
                         React.createElement(TextInput, { value: data.candidates_name[k], onChange: v => set(['part3', 'expA', 'candidates_name', k], v), placeholder: "\uBB3C\uC9C8\uBA85" })),
                     data.temp_data[k].map((v, i) => React.createElement("td", { key: i },
-                        React.createElement(TextInput, { value: v, onChange: x => set(['part3', 'expA', 'temp_data', k, i], x), type: "number" })))))))),
+                        React.createElement(TextInput, { value: v, onChange: x => set(['part3', 'expA', 'temp_data', k, i], x), type: "number" }))))))))),
         React.createElement(BulletH, null, "\uB0C9\uAC01 \uACE1\uC120 (\uB370\uC774\uD130 \uC785\uB825 \uC2DC \uC790\uB3D9 \uC0DD\uC131)"),
         React.createElement(CoolingCurveChart, { data: data.temp_data, names: data.candidates_name }),
         React.createElement(BulletH, null, "\uC774\uB860\uAC12\uACFC \uC2E4\uD5D8\uAC12 \uBE44\uAD50"),
@@ -1820,6 +1899,7 @@ function ExpB({ data, set }) {
                 React.createElement("td", null,
                     React.createElement(TextArea, { value: s, onChange: v => set(['part3', 'expB', 'steps', i], v) }))))))),
         React.createElement(BulletH, null, "\uC2E4\uD5D8 \uB370\uC774\uD130 \u2014 \uC2DC\uAC04\uC5D0 \uB530\uB978 \uC735\uD574\uB41C \uBB3C\uC758 \uB204\uC801 \uC9C8\uB7C9 (\uB2E8\uC704: g)"),
+        React.createElement("div", { className: "scroll-table" },
         React.createElement("table", { className: "ftbl" },
             React.createElement("colgroup", null,
                 React.createElement("col", { style: { width: '180px' } }),
@@ -1843,7 +1923,7 @@ function ExpB({ data, set }) {
                         "\uD6C4\uBCF4 ",
                         k),
                     data.melt_data[k].map((v, i) => React.createElement("td", { key: i },
-                        React.createElement(TextInput, { value: v, onChange: x => set(['part3', 'expB', 'melt_data', k, i], x), type: "number" })))))))),
+                        React.createElement(TextInput, { value: v, onChange: x => set(['part3', 'expB', 'melt_data', k, i], x), type: "number" }))))))))),
         React.createElement(BulletH, null, "\uADF8\uB798\uD504 (\uC2DC\uAC04 vs \uB204\uC801 \uC735\uD574\uB7C9) \u2014 \uC790\uB3D9 \uC0DD\uC131"),
         React.createElement(MeltingCurveChart, { data: data.melt_data }),
         React.createElement(BulletH, null, "\uBD84\uC11D \u2014 \uC5B4\uB290 \uD6C4\uBCF4\uAC00 \uAC00\uC7A5 \uD6A8\uACFC\uC801\uC778\uAC00? \uC2E4\uD5D8 A\uC758 \uACB0\uACFC\uC640 \uC5B4\uB5BB\uAC8C \uBE44\uAD50\uB418\uB294\uAC00?"),
@@ -3408,12 +3488,25 @@ function CollabApp({ user, isAdminUser, klass, group, onExit, onChangePassword }
 
                 unsub = await subscribeToGroupData(klass.id, group.id, (val) => {
                     // Merge with EMPTY_DATA structure to keep field shape stable
-                    const merged = deepMerge(EMPTY_DATA, val || {});
-                    // Re-apply any locally-pending writes that haven't been echoed yet
+                    let merged = deepMerge(EMPTY_DATA, val || {});
+                    // Apply any locally-pending writes that haven't been confirmed yet
+                    // (prevents the user's recent local edits from being clobbered
+                    //  by an older snapshot during the write round-trip)
                     const now = Date.now();
-                    pendingWrites.current.forEach((ts, pathStr) => {
-                        if (now - ts > 5000) pendingWrites.current.delete(pathStr); // expire
+                    const stale = [];
+                    pendingWrites.current.forEach((entry, pathStr) => {
+                        if (now - entry.ts > 5000) {
+                            stale.push(pathStr);
+                            return;
+                        }
+                        // Re-apply local value to merged tree
+                        const pathArr = pathStr.split('/').map(p => {
+                            const n = parseInt(p, 10);
+                            return (isNaN(n) || String(n) !== p) ? p : n;
+                        });
+                        merged = update(merged, pathArr, entry.value);
                     });
+                    stale.forEach(p => pendingWrites.current.delete(p));
                     localDataRef.current = merged;
                     setData(merged);
                     setSyncState('synced');
@@ -3446,7 +3539,7 @@ function CollabApp({ user, isAdminUser, klass, group, onExit, onChangePassword }
             return newData;
         });
         const pathStr = path.join('/');
-        pendingWrites.current.set(pathStr, Date.now());
+        pendingWrites.current.set(pathStr, { value, ts: Date.now() });
         // Debounce write per path
         const existing = writeTimers.current.get(pathStr);
         if (existing) clearTimeout(existing);
@@ -3454,6 +3547,14 @@ function CollabApp({ user, isAdminUser, klass, group, onExit, onChangePassword }
             writeTimers.current.delete(pathStr);
             try {
                 await writeGroupDataPath(klass.id, group.id, path, value);
+                // After successful write, clear pending after a brief grace period
+                // (give Firebase echo time to round-trip)
+                setTimeout(() => {
+                    const cur = pendingWrites.current.get(pathStr);
+                    if (cur && cur.value === value) {
+                        pendingWrites.current.delete(pathStr);
+                    }
+                }, 1500);
             } catch (e) {
                 console.error('Write failed:', pathStr, e);
                 setSyncState('error');
