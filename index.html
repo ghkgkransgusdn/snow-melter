@@ -284,6 +284,17 @@
     margin: 0 auto 14px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* ============= DATATABLE CHART ============= */
+  .datatable-wrap { margin: 6px 0 16px; }
+  .datatable-chart { display: block; width: 100%; max-width: 720px; }
+  .chart-controls label { font-size: 12px; color: #374151; display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+  .chart-controls select, .chart-controls input[type=text] { font-size: 13px; }
+  @media (max-width: 640px) {
+    .chart-controls { padding: 8px !important; }
+    .chart-controls > div { gap: 8px !important; }
+    .chart-controls label { width: 100%; }
+    .chart-controls input[type=text] { max-width: 100% !important; }
+  }
   /* ============= RESPONSIVE LAYOUT ============= */
   @media (max-width: 900px) {
     body { font-size: 13px; }
@@ -3243,29 +3254,1001 @@ const SNOW_MELTER_SECTIONS = [
 ];
 
 // =====================================================================
-// GENERIC EXPERIMENT REPORT TEMPLATE — 어떤 실험에도 쓸 수 있는 일반 양식
+// SHARED REPORT-BUILDING COMPONENTS
 // =====================================================================
-const GENERIC_EMPTY_DATA = {
-    cover: { title: '', subtitle: '', group_name: '', members: '', teacher: '', date: '' },
-    motivation: '',
-    research_question: '',
-    hypothesis: '',
-    variables: { independent: '', dependent: '', controlled: '' },
-    materials: '',
-    procedure: ['', '', '', '', '', '', ''],
-    data_records: '',
-    photos: { p1: '', p2: '', p3: '', p4: '' },
-    analysis: '',
-    conclusion: '',
-    reflection: '',
-    references: ['', '', '', '', ''],
-};
+// Editable plain text block — pairs with a section label
+function TextBlock({ value, onChange, placeholder, huge }) {
+    return React.createElement('table', { className: 'ftbl' },
+        React.createElement('tbody', null,
+            React.createElement('tr', null,
+                React.createElement('td', null,
+                    React.createElement(TextArea, { value, onChange, placeholder, big: true, huge: huge !== false })))));
+}
 
-function GenericCoverSection({ data, set }) {
-    const c = data.cover;
+// Numbered list block — for step-by-step content (procedure, ideas, etc.)
+function NumberedList({ items, onChange, label, minRows = 3 }) {
+    const list = items && items.length ? items : ['', '', ''];
+    const setAt = (i, v) => {
+        const next = list.slice();
+        next[i] = v;
+        // Trim trailing empties but keep at least minRows
+        while (next.length > minRows && !next[next.length - 1]) next.pop();
+        onChange(next);
+    };
+    const addRow = () => onChange([...list, '']);
+    const removeRow = (i) => {
+        const next = list.slice();
+        next.splice(i, 1);
+        if (next.length < minRows) while (next.length < minRows) next.push('');
+        onChange(next);
+    };
+    return React.createElement('div', null,
+        React.createElement('table', { className: 'ftbl' },
+            React.createElement('colgroup', null,
+                React.createElement('col', { style: { width: '80px' } }),
+                React.createElement('col', null),
+                React.createElement('col', { style: { width: '60px' } })),
+            React.createElement('tbody', null,
+                list.map((s, i) => React.createElement('tr', { key: i },
+                    React.createElement('td', { className: 'label-left' }, label || '항목', ' ', i + 1),
+                    React.createElement('td', null,
+                        React.createElement(TextArea, { value: s, onChange: v => setAt(i, v) })),
+                    React.createElement('td', { className: 'no-stack-cell' },
+                        React.createElement('button', {
+                            className: 'btn btn-secondary',
+                            onClick: () => removeRow(i),
+                            style: { fontSize: 11, padding: '4px 6px' },
+                            title: '이 행 삭제'
+                        }, '✕')))))),
+        React.createElement('div', { style: { marginTop: 6 } },
+            React.createElement('button', {
+                className: 'btn btn-secondary',
+                onClick: addRow,
+                style: { fontSize: 12 }
+            }, '+ 행 추가')));
+}
+
+// =====================================================================
+// DATATABLE WITH CHART — editable spreadsheet-like table + auto-chart
+// =====================================================================
+// Data shape:
+//   { columns: ['x', 'y1', ...],
+//     rows: [['1.0','2.3'], ...],
+//     chart: { type, xCol, yCols, trendline, title } }
+function emptyDataTable(numericCols = 2, numRows = 5) {
+    const cols = ['x'];
+    for (let i = 1; i < numericCols; i++) cols.push('y' + (i > 1 ? i : ''));
+    const rows = [];
+    for (let i = 0; i < numRows; i++) {
+        rows.push(cols.map(() => ''));
+    }
+    return {
+        columns: cols,
+        rows,
+        chart: {
+            type: 'none', xCol: 0, yCols: [1], title: '',
+            trendline: 'none',        // 'none' | 'linear' | 'poly2' | 'poly3' | 'exp' | 'power' | 'log' | 'ma3' | 'ma5'
+            trendSeries: 'all',       // 'all' | 0..N (apply trendline to which y-series)
+            showEquation: true,       // show fit equation + R²
+            yLogScale: false,         // log scale on y-axis
+            yMinManual: '',           // override yMin (string from input)
+            yMaxManual: '',
+            xMinManual: '',
+            xMaxManual: '',
+            showGrid: true,
+            showPoints: true,
+            showLine: false,          // for scatter, show connecting line (rare); for 'line' always true
+            showLabels: false,        // value labels next to each point
+            errorCol: -1,             // column index for ± error bars (applied to all y-series), -1 = disabled
+        },
+    };
+}
+
+// ===== REGRESSION & FITTING SUITE =====
+
+// Generic R² calculator given predictions
+function calcR2(ys, preds) {
+    const n = ys.length;
+    if (n < 2) return 0;
+    let meanY = 0;
+    for (let i = 0; i < n; i++) meanY += ys[i];
+    meanY /= n;
+    let ssTot = 0, ssRes = 0;
+    for (let i = 0; i < n; i++) {
+        ssTot += (ys[i] - meanY) * (ys[i] - meanY);
+        ssRes += (ys[i] - preds[i]) * (ys[i] - preds[i]);
+    }
+    return ssTot === 0 ? 1 : 1 - ssRes / ssTot;
+}
+
+// Linear regression: returns { type:'linear', coeffs:[intercept, slope], r2, predict(x), equation }
+function linearRegression(xs, ys) {
+    const n = xs.length;
+    if (n < 2) return null;
+    let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+    for (let i = 0; i < n; i++) {
+        sumX += xs[i]; sumY += ys[i];
+        sumXY += xs[i] * ys[i];
+        sumX2 += xs[i] * xs[i];
+    }
+    const meanX = sumX / n, meanY = sumY / n;
+    const denom = sumX2 - n * meanX * meanX;
+    if (denom === 0) return null;
+    const slope = (sumXY - n * meanX * meanY) / denom;
+    const intercept = meanY - slope * meanX;
+    const predict = x => slope * x + intercept;
+    const preds = xs.map(predict);
+    const r2 = calcR2(ys, preds);
+    const sign = intercept >= 0 ? '+' : '−';
+    const equation = `y = ${fmtNum(slope)}x ${sign} ${fmtNum(Math.abs(intercept))}`;
+    return { type: 'linear', coeffs: [intercept, slope], r2, predict, equation };
+}
+
+// Format a number nicely for equations (4 sig figs, scientific if very small/large)
+function fmtNum(v) {
+    if (!Number.isFinite(v)) return '?';
+    const abs = Math.abs(v);
+    if (abs === 0) return '0';
+    if (abs < 0.001 || abs >= 100000) return v.toExponential(3);
+    if (abs < 1) return v.toPrecision(4);
+    return v.toPrecision(5).replace(/\.?0+$/, '');
+}
+
+// Solve a linear system Ax = b using Gaussian elimination with partial pivoting.
+// A is array of arrays (rows), b is array. Returns x or null if singular.
+function solveLinearSystem(A, b) {
+    const n = A.length;
+    // Build augmented matrix
+    const M = A.map((row, i) => [...row, b[i]]);
+    for (let col = 0; col < n; col++) {
+        // Pivot
+        let maxRow = col;
+        for (let r = col + 1; r < n; r++) if (Math.abs(M[r][col]) > Math.abs(M[maxRow][col])) maxRow = r;
+        if (Math.abs(M[maxRow][col]) < 1e-12) return null;
+        [M[col], M[maxRow]] = [M[maxRow], M[col]];
+        // Eliminate below
+        for (let r = col + 1; r < n; r++) {
+            const f = M[r][col] / M[col][col];
+            for (let c = col; c <= n; c++) M[r][c] -= f * M[col][c];
+        }
+    }
+    // Back-substitution
+    const x = new Array(n).fill(0);
+    for (let i = n - 1; i >= 0; i--) {
+        let s = M[i][n];
+        for (let j = i + 1; j < n; j++) s -= M[i][j] * x[j];
+        x[i] = s / M[i][i];
+    }
+    return x;
+}
+
+// Polynomial regression of degree d. Returns coeffs from low to high: c0 + c1*x + c2*x^2 + ...
+function polynomialRegression(xs, ys, degree) {
+    const n = xs.length;
+    if (n < degree + 1) return null;
+    // Build normal equations: A * c = b
+    const k = degree + 1;
+    const A = [];
+    for (let i = 0; i < k; i++) {
+        A.push(new Array(k).fill(0));
+    }
+    const b = new Array(k).fill(0);
+    // Cache powers of x
+    for (let i = 0; i < n; i++) {
+        let xPowSum = 1;
+        // We need sum(x^(i+j)) for matrix
+    }
+    // Fill A[i][j] = sum x^(i+j), b[i] = sum y * x^i
+    for (let i = 0; i < k; i++) {
+        for (let j = 0; j < k; j++) {
+            let s = 0;
+            for (let p = 0; p < n; p++) s += Math.pow(xs[p], i + j);
+            A[i][j] = s;
+        }
+        let s2 = 0;
+        for (let p = 0; p < n; p++) s2 += ys[p] * Math.pow(xs[p], i);
+        b[i] = s2;
+    }
+    const coeffs = solveLinearSystem(A, b);
+    if (!coeffs) return null;
+    const predict = x => {
+        let s = 0;
+        for (let i = 0; i < coeffs.length; i++) s += coeffs[i] * Math.pow(x, i);
+        return s;
+    };
+    const preds = xs.map(predict);
+    const r2 = calcR2(ys, preds);
+
+    // Build equation
+    let parts = [];
+    for (let i = coeffs.length - 1; i >= 0; i--) {
+        const c = coeffs[i];
+        if (i === 0) {
+            parts.push((c >= 0 ? ' + ' : ' − ') + fmtNum(Math.abs(c)));
+        } else if (i === 1) {
+            parts.push((parts.length === 0 ? (c < 0 ? '−' : '') : (c >= 0 ? ' + ' : ' − ')) + fmtNum(Math.abs(c)) + 'x');
+        } else {
+            parts.push((parts.length === 0 ? (c < 0 ? '−' : '') : (c >= 0 ? ' + ' : ' − ')) + fmtNum(Math.abs(c)) + 'x^' + i);
+        }
+    }
+    const equation = 'y = ' + parts.join('');
+
+    return { type: 'poly' + degree, coeffs, r2, predict, equation };
+}
+
+// Exponential fit: y = a * e^(b*x). Requires all y > 0.
+// We fit ln(y) = ln(a) + b*x linearly.
+function exponentialRegression(xs, ys) {
+    const validXs = [], validLnYs = [];
+    for (let i = 0; i < xs.length; i++) {
+        if (ys[i] > 0 && Number.isFinite(xs[i])) {
+            validXs.push(xs[i]);
+            validLnYs.push(Math.log(ys[i]));
+        }
+    }
+    if (validXs.length < 2) return null;
+    const lin = linearRegression(validXs, validLnYs);
+    if (!lin) return null;
+    // lin.coeffs = [intercept = ln(a), slope = b]
+    const lnA = lin.coeffs[0];
+    const b = lin.coeffs[1];
+    const a = Math.exp(lnA);
+    const predict = x => a * Math.exp(b * x);
+    // R² computed on original y scale for honest comparison
+    const ysUsed = [], predsUsed = [];
+    for (let i = 0; i < xs.length; i++) {
+        if (ys[i] > 0) { ysUsed.push(ys[i]); predsUsed.push(predict(xs[i])); }
+    }
+    const r2 = calcR2(ysUsed, predsUsed);
+    const equation = `y = ${fmtNum(a)} · e^(${fmtNum(b)}x)`;
+    return { type: 'exp', coeffs: [a, b], r2, predict, equation };
+}
+
+// Power fit: y = a * x^b. Requires x > 0 and y > 0.
+// ln(y) = ln(a) + b * ln(x)
+function powerRegression(xs, ys) {
+    const lnXs = [], lnYs = [], originalIdx = [];
+    for (let i = 0; i < xs.length; i++) {
+        if (xs[i] > 0 && ys[i] > 0) {
+            lnXs.push(Math.log(xs[i]));
+            lnYs.push(Math.log(ys[i]));
+            originalIdx.push(i);
+        }
+    }
+    if (lnXs.length < 2) return null;
+    const lin = linearRegression(lnXs, lnYs);
+    if (!lin) return null;
+    const lnA = lin.coeffs[0];
+    const b = lin.coeffs[1];
+    const a = Math.exp(lnA);
+    const predict = x => (x > 0 ? a * Math.pow(x, b) : NaN);
+    const ysUsed = [], predsUsed = [];
+    for (const i of originalIdx) { ysUsed.push(ys[i]); predsUsed.push(predict(xs[i])); }
+    const r2 = calcR2(ysUsed, predsUsed);
+    const equation = `y = ${fmtNum(a)} · x^${fmtNum(b)}`;
+    return { type: 'power', coeffs: [a, b], r2, predict, equation };
+}
+
+// Logarithmic fit: y = a + b * ln(x). Requires x > 0.
+function logarithmicRegression(xs, ys) {
+    const lnXs = [], usedYs = [], originalIdx = [];
+    for (let i = 0; i < xs.length; i++) {
+        if (xs[i] > 0) {
+            lnXs.push(Math.log(xs[i]));
+            usedYs.push(ys[i]);
+            originalIdx.push(i);
+        }
+    }
+    if (lnXs.length < 2) return null;
+    const lin = linearRegression(lnXs, usedYs);
+    if (!lin) return null;
+    const a = lin.coeffs[0];
+    const b = lin.coeffs[1];
+    const predict = x => (x > 0 ? a + b * Math.log(x) : NaN);
+    const preds = originalIdx.map(i => predict(xs[i]));
+    const ysUsed = originalIdx.map(i => ys[i]);
+    const r2 = calcR2(ysUsed, preds);
+    const sign = a >= 0 ? '+' : '−';
+    const equation = `y = ${fmtNum(a)} ${sign} ${fmtNum(Math.abs(b))} · ln(x)`.replace('+', '+').replace('y = ', 'y = ').replace('+ −', '−');
+    // Cleaner: handle 'a + b·ln(x)' with sign on b
+    const eq2 = `y = ${fmtNum(b)} · ln(x) ${a >= 0 ? '+' : '−'} ${fmtNum(Math.abs(a))}`;
+    return { type: 'log', coeffs: [a, b], r2, predict, equation: eq2 };
+}
+
+// Simple moving average smoother (no equation/R²; just a smoothed line).
+// Window size w, applied to points sorted by x.
+function movingAverageFit(xs, ys, windowSize) {
+    const w = Math.max(1, windowSize | 0);
+    // Sort points by x
+    const idxs = xs.map((x, i) => i).filter(i => Number.isFinite(xs[i]) && Number.isFinite(ys[i]));
+    idxs.sort((a, b) => xs[a] - xs[b]);
+    const sortedX = idxs.map(i => xs[i]);
+    const sortedY = idxs.map(i => ys[i]);
+    // Compute moving average centered
+    const half = Math.floor(w / 2);
+    const smoothed = [];
+    for (let i = 0; i < sortedY.length; i++) {
+        let s = 0, c = 0;
+        for (let k = Math.max(0, i - half); k <= Math.min(sortedY.length - 1, i + half); k++) {
+            s += sortedY[k]; c++;
+        }
+        smoothed.push(s / c);
+    }
+    // Provide a predict by interpolating between sorted points
+    const predict = (x) => {
+        if (sortedX.length === 0) return NaN;
+        if (x <= sortedX[0]) return smoothed[0];
+        if (x >= sortedX[sortedX.length - 1]) return smoothed[smoothed.length - 1];
+        for (let i = 0; i < sortedX.length - 1; i++) {
+            if (x >= sortedX[i] && x <= sortedX[i + 1]) {
+                const t = (x - sortedX[i]) / (sortedX[i + 1] - sortedX[i]);
+                return smoothed[i] + t * (smoothed[i + 1] - smoothed[i]);
+            }
+        }
+        return NaN;
+    };
+    const preds = idxs.map((i, k) => smoothed[k]);
+    const r2 = calcR2(idxs.map(i => ys[i]), preds);
+    return {
+        type: 'ma',
+        coeffs: [],
+        r2,
+        predict,
+        equation: `이동평균 (윈도우 ${w}개)`,
+        // expose the actual sorted smoothed path for accurate drawing
+        smoothedPath: sortedX.map((x, k) => ({ x, y: smoothed[k] })),
+    };
+}
+
+// Master fit dispatcher
+function fitData(xs, ys, kind) {
+    if (!kind || kind === 'none') return null;
+    switch (kind) {
+        case 'linear': return polynomialRegression(xs, ys, 1) || linearRegression(xs, ys);
+        case 'poly2': return polynomialRegression(xs, ys, 2);
+        case 'poly3': return polynomialRegression(xs, ys, 3);
+        case 'poly4': return polynomialRegression(xs, ys, 4);
+        case 'exp': return exponentialRegression(xs, ys);
+        case 'power': return powerRegression(xs, ys);
+        case 'log': return logarithmicRegression(xs, ys);
+        case 'ma3': return movingAverageFit(xs, ys, 3);
+        case 'ma5': return movingAverageFit(xs, ys, 5);
+        case 'ma7': return movingAverageFit(xs, ys, 7);
+        default: return null;
+    }
+}
+
+// Friendly Korean label for a fit kind
+function fitKindLabel(kind) {
+    return ({
+        none: '없음',
+        linear: '선형 (y = ax + b)',
+        poly2: '2차 곡선 (y = ax² + bx + c)',
+        poly3: '3차 곡선',
+        poly4: '4차 곡선',
+        exp: '지수 (y = a·e^(bx))',
+        power: '거듭제곱 (y = a·x^b)',
+        log: '로그 (y = a·ln(x) + b)',
+        ma3: '이동평균 (3개)',
+        ma5: '이동평균 (5개)',
+        ma7: '이동평균 (7개)',
+    })[kind] || kind;
+}
+
+// Y-series colors for charts
+const SERIES_COLORS = ['#dc2626', '#2563eb', '#16a34a', '#a855f7', '#ea580c', '#0891b2', '#db2777'];
+
+// Render a datatable's chart to a canvas. Returns true if anything was drawn.
+function renderDataTableChart(canvas, dt, opts = {}) {
+    const _hasTrend = dt && dt.chart && dt.chart.trendline && dt.chart.trendline !== 'none' && dt.chart.showEquation !== false;
+    const defaultH = _hasTrend ? 400 : 320;
+    const { ctx, width, height } = prepareCanvas(canvas, opts.minHeight || defaultH);
+    const chart = dt.chart || {};
+    const type = chart.type || 'none';
+    if (type === 'none') {
+        drawNoData(ctx, width, height, chart.title || '그래프');
+        return false;
+    }
+    const xCol = chart.xCol || 0;
+    const yCols = (chart.yCols || []).filter(c => c >= 0 && c < dt.columns.length && c !== xCol);
+    if (yCols.length === 0) {
+        drawNoData(ctx, width, height, chart.title || '그래프 — y축 데이터 선택');
+        return false;
+    }
+    // Collect numeric data
+    const xs = [];
+    const series = yCols.map(() => []);
+    for (const row of (dt.rows || [])) {
+        const xRaw = row[xCol];
+        const xVal = (xRaw === '' || xRaw == null) ? null : parseFloat(xRaw);
+        const ysRaw = yCols.map(c => row[c]);
+        const ysVal = ysRaw.map(v => (v === '' || v == null) ? null : parseFloat(v));
+        // For bar chart, x can be a category label string
+        if (type === 'bar') {
+            if (xRaw == null || xRaw === '') continue;
+            xs.push(String(xRaw));
+            ysVal.forEach((v, i) => series[i].push(Number.isFinite(v) ? v : null));
+        } else {
+            if (!Number.isFinite(xVal)) continue;
+            xs.push(xVal);
+            ysVal.forEach((v, i) => series[i].push(Number.isFinite(v) ? v : null));
+        }
+    }
+    // Check that we have any data
+    const anyData = series.some(s => s.some(v => v != null));
+    if (!anyData) {
+        drawNoData(ctx, width, height, chart.title || '그래프');
+        return false;
+    }
+
+    // ===== Chart layout =====
+    // Reserve extra space at bottom if trendlines are enabled (for equation panel)
+    const hasTrend = chart.trendline && chart.trendline !== 'none' && chart.showEquation !== false;
+    const padTop = 50, padLeft = 60, padRight = 30;
+    const padBottom = 60 + (hasTrend ? 70 : 0);
+    const plotW = width - padLeft - padRight;
+    const plotH = height - padTop - padBottom;
+    const plotX0 = padLeft, plotY0 = padTop;
+
+    // Background
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, width, height);
+
+    // Title
+    if (chart.title) {
+        ctx.fillStyle = '#111827';
+        ctx.font = 'bold 15px Malgun Gothic, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(chart.title, width / 2, 26);
+    }
+
+    // Axis labels (column names)
+    const xLabel = dt.columns[xCol] || 'x';
+    ctx.fillStyle = '#374151';
+    ctx.font = '12px Malgun Gothic, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(xLabel, plotX0 + plotW / 2, height - 18);
+
+    // ===== Compute axis ranges =====
+    let yMin = Infinity, yMax = -Infinity;
+    series.forEach(s => s.forEach(v => { if (v != null) { if (v < yMin) yMin = v; if (v > yMax) yMax = v; } }));
+    if (!Number.isFinite(yMin) || !Number.isFinite(yMax)) { yMin = 0; yMax = 1; }
+
+    const yLog = !!chart.yLogScale && yMin > 0;
+    let yRange;
+    if (yLog) {
+        // Log scale: use min/max in log space
+        const logMin = Math.log10(Math.max(yMin, 1e-300));
+        const logMax = Math.log10(Math.max(yMax, 1e-300));
+        const pad = (logMax - logMin) * 0.05 || 0.1;
+        yRange = { min: Math.pow(10, logMin - pad), max: Math.pow(10, logMax + pad), log: true };
+    } else {
+        yRange = niceRange(yMin, yMax);
+    }
+    // Manual override
+    const yMinMan = parseFloat(chart.yMinManual);
+    const yMaxMan = parseFloat(chart.yMaxManual);
+    if (Number.isFinite(yMinMan)) yRange.min = yMinMan;
+    if (Number.isFinite(yMaxMan)) yRange.max = yMaxMan;
+    if (yLog) {
+        if (yRange.min <= 0) yRange.min = 1e-10;
+    }
+
+    let xMin, xMax, xCategories;
+    if (type === 'bar') {
+        xCategories = xs;
+        xMin = 0; xMax = xs.length;
+    } else {
+        let xLo = Infinity, xHi = -Infinity;
+        xs.forEach(v => { if (v < xLo) xLo = v; if (v > xHi) xHi = v; });
+        const xR = niceRange(xLo, xHi);
+        xMin = xR.min; xMax = xR.max;
+        const xMinMan = parseFloat(chart.xMinManual);
+        const xMaxMan = parseFloat(chart.xMaxManual);
+        if (Number.isFinite(xMinMan)) xMin = xMinMan;
+        if (Number.isFinite(xMaxMan)) xMax = xMaxMan;
+    }
+
+    // ===== Draw grid & axes =====
+    const showGrid = chart.showGrid !== false;
+    ctx.fillStyle = '#6b7280';
+    ctx.font = '11px Malgun Gothic, sans-serif';
+    // Y grid
+    const yTicks = 5;
+    if (showGrid) {
+        ctx.strokeStyle = '#e5e7eb';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+    }
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= yTicks; i++) {
+        const y = plotY0 + plotH - (i / yTicks) * plotH;
+        if (showGrid) { ctx.moveTo(plotX0, y); ctx.lineTo(plotX0 + plotW, y); }
+        let val;
+        if (yLog) {
+            const lo = Math.log10(yRange.min), hi = Math.log10(yRange.max);
+            val = Math.pow(10, lo + (i / yTicks) * (hi - lo));
+        } else {
+            val = yRange.min + (i / yTicks) * (yRange.max - yRange.min);
+        }
+        ctx.fillText(fmtAxisVal(val, yLog), plotX0 - 6, y + 4);
+    }
+    // X grid
+    if (type === 'bar') {
+        // category labels handled in bar drawing
+    } else {
+        const xTicks = 5;
+        ctx.textAlign = 'center';
+        for (let i = 0; i <= xTicks; i++) {
+            const x = plotX0 + (i / xTicks) * plotW;
+            if (showGrid) { ctx.moveTo(x, plotY0); ctx.lineTo(x, plotY0 + plotH); }
+            const val = xMin + (i / xTicks) * (xMax - xMin);
+            ctx.fillText(fmtAxisVal(val, false), x, plotY0 + plotH + 16);
+        }
+    }
+    if (showGrid) ctx.stroke();
+
+    // Axis lines
+    ctx.strokeStyle = '#374151';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(plotX0, plotY0);
+    ctx.lineTo(plotX0, plotY0 + plotH);
+    ctx.lineTo(plotX0 + plotW, plotY0 + plotH);
+    ctx.stroke();
+
+    // ===== Plot data =====
+    const toY = (val) => {
+        if (yLog) {
+            const lo = Math.log10(yRange.min), hi = Math.log10(yRange.max);
+            const lv = Math.log10(Math.max(val, 1e-300));
+            return plotY0 + plotH - (lv - lo) / (hi - lo) * plotH;
+        }
+        return plotY0 + plotH - (val - yRange.min) / (yRange.max - yRange.min) * plotH;
+    };
+    const toX = (val) => plotX0 + (val - xMin) / (xMax - xMin) * plotW;
+
+    // Error column values (for ± error bars)
+    const errorVals = [];
+    if (Number.isInteger(chart.errorCol) && chart.errorCol >= 0 && chart.errorCol < dt.columns.length) {
+        for (const row of (dt.rows || [])) {
+            const v = row[chart.errorCol];
+            errorVals.push((v === '' || v == null) ? null : parseFloat(v));
+        }
+    }
+
+    const drawScatterOrLine = (sIdx, points, isLine, showPoints, showLabels, errorBars) => {
+        const color = SERIES_COLORS[sIdx % SERIES_COLORS.length];
+        const valid = points.filter(p => p.y != null && Number.isFinite(p.y));
+        // Connecting line
+        if (isLine) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            valid.forEach((p, i) => {
+                const px = toX(p.x);
+                const py = toY(p.y);
+                if (i === 0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+            });
+            ctx.stroke();
+        }
+        // Error bars (drawn before points so points sit on top)
+        if (errorBars && errorBars.length) {
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1.2;
+            valid.forEach((p, i) => {
+                const err = errorBars[p._origIdx];
+                if (err == null || !Number.isFinite(err) || err === 0) return;
+                const px = toX(p.x);
+                const yTop = toY(p.y + err);
+                const yBot = toY(p.y - err);
+                ctx.beginPath();
+                ctx.moveTo(px, yTop); ctx.lineTo(px, yBot);
+                // caps
+                ctx.moveTo(px - 4, yTop); ctx.lineTo(px + 4, yTop);
+                ctx.moveTo(px - 4, yBot); ctx.lineTo(px + 4, yBot);
+                ctx.stroke();
+            });
+        }
+        // Points
+        if (showPoints) {
+            ctx.fillStyle = color;
+            valid.forEach(p => {
+                const px = toX(p.x);
+                const py = toY(p.y);
+                ctx.beginPath();
+                ctx.arc(px, py, 4, 0, Math.PI * 2);
+                ctx.fill();
+            });
+        }
+        // Point labels (small text next to each point)
+        if (showLabels) {
+            ctx.fillStyle = '#111827';
+            ctx.font = '10px Malgun Gothic, sans-serif';
+            ctx.textAlign = 'left';
+            valid.forEach(p => {
+                const px = toX(p.x);
+                const py = toY(p.y);
+                ctx.fillText(`(${fmtNum(p.x)}, ${fmtNum(p.y)})`, px + 6, py - 6);
+            });
+        }
+    };
+
+    // Collected fit equations for legend display (one per y-series if trendline enabled)
+    const trendLabels = [];
+    if (type === 'scatter' || type === 'line') {
+        const isLine = type === 'line';
+        const showPoints = chart.showPoints !== false;
+        const showLabels = !!chart.showLabels;
+        // Draw each y-series
+        yCols.forEach((col, sIdx) => {
+            const pts = xs.map((x, i) => ({ x, y: series[sIdx][i], _origIdx: i }));
+            drawScatterOrLine(sIdx, pts, isLine, showPoints, showLabels, errorVals);
+        });
+
+        // Draw trendlines (per series, or just first, depending on trendSeries)
+        if (chart.trendline && chart.trendline !== 'none') {
+            const targetIdxs = (chart.trendSeries === 'all' || chart.trendSeries == null)
+                ? yCols.map((_, i) => i)
+                : (Number.isInteger(chart.trendSeries) && chart.trendSeries >= 0 && chart.trendSeries < yCols.length)
+                    ? [chart.trendSeries]
+                    : [0];
+            for (const sIdx of targetIdxs) {
+                const validXs = [], validYs = [];
+                xs.forEach((x, i) => {
+                    const y = series[sIdx][i];
+                    if (Number.isFinite(x) && y != null && Number.isFinite(y)) { validXs.push(x); validYs.push(y); }
+                });
+                const fit = fitData(validXs, validYs, chart.trendline);
+                if (!fit) continue;
+                const color = SERIES_COLORS[sIdx % SERIES_COLORS.length];
+                // Convert to a darker stroke
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1.6;
+                ctx.setLineDash([7, 4]);
+                ctx.beginPath();
+                // Use moving-average's smoothed path if present (more accurate)
+                if (fit.smoothedPath && fit.smoothedPath.length) {
+                    fit.smoothedPath.forEach((p, i) => {
+                        const px = toX(p.x);
+                        const py = toY(p.y);
+                        if (i === 0) ctx.moveTo(px, py);
+                        else ctx.lineTo(px, py);
+                    });
+                } else {
+                    // Sample curve across x range
+                    const steps = 120;
+                    let started = false;
+                    for (let k = 0; k <= steps; k++) {
+                        const x = xMin + (k / steps) * (xMax - xMin);
+                        const y = fit.predict(x);
+                        if (!Number.isFinite(y)) { started = false; continue; }
+                        const px = toX(x);
+                        const py = toY(y);
+                        if (!started) { ctx.moveTo(px, py); started = true; }
+                        else ctx.lineTo(px, py);
+                    }
+                }
+                ctx.stroke();
+                ctx.setLineDash([]);
+                if (chart.showEquation !== false) {
+                    const seriesName = dt.columns[yCols[sIdx]] || ('y' + (sIdx + 1));
+                    const eqLabel = `${seriesName}: ${fit.equation}` + (fit.type === 'ma' ? '' : `    R² = ${fit.r2.toFixed(4)}`);
+                    trendLabels.push({ text: eqLabel, color });
+                }
+            }
+        }
+    } else if (type === 'bar') {
+        const groupCount = xs.length;
+        const groupW = plotW / Math.max(groupCount, 1);
+        const barW = (groupW * 0.72) / yCols.length;
+        xs.forEach((cat, gi) => {
+            yCols.forEach((col, sIdx) => {
+                const v = series[sIdx][gi];
+                if (v == null) return;
+                const color = SERIES_COLORS[sIdx % SERIES_COLORS.length];
+                const bx = plotX0 + groupW * gi + groupW * 0.14 + barW * sIdx;
+                const by = toY(v);
+                const bh = plotY0 + plotH - by;
+                ctx.fillStyle = color;
+                ctx.fillRect(bx, by, barW, bh);
+            });
+            // Category label
+            ctx.fillStyle = '#374151';
+            ctx.font = '11px Malgun Gothic, sans-serif';
+            ctx.textAlign = 'center';
+            const cx = plotX0 + groupW * gi + groupW / 2;
+            ctx.fillText(String(cat), cx, plotY0 + plotH + 16);
+        });
+    }
+
+    // ===== Legend =====
+    const legendY = padTop / 2 + 4;
+    let legendX = plotX0;
+    ctx.font = '11px Malgun Gothic, sans-serif';
+    ctx.textAlign = 'left';
+    yCols.forEach((col, sIdx) => {
+        const color = SERIES_COLORS[sIdx % SERIES_COLORS.length];
+        const label = dt.columns[col] || ('y' + (sIdx + 1));
+        const textW = ctx.measureText(label).width;
+        ctx.fillStyle = color;
+        ctx.fillRect(legendX, legendY - 8, 12, 12);
+        ctx.fillStyle = '#111827';
+        ctx.fillText(label, legendX + 18, legendY + 2);
+        legendX += textW + 36;
+    });
+
+    // Fit equations panel — below the plot
+    if (trendLabels.length) {
+        let ty = plotY0 + plotH + (type === 'bar' ? 36 : 32);
+        const maxFit = 4;
+        ctx.font = 'bold 11px Malgun Gothic, sans-serif';
+        ctx.textAlign = 'left';
+        trendLabels.slice(0, maxFit).forEach((l) => {
+            // Small color swatch
+            ctx.fillStyle = l.color;
+            ctx.fillRect(plotX0, ty - 8, 10, 10);
+            ctx.fillStyle = '#111827';
+            ctx.fillText(l.text, plotX0 + 16, ty);
+            ty += 14;
+        });
+        if (trendLabels.length > maxFit) {
+            ctx.fillStyle = '#6b7280';
+            ctx.fillText(`(외 ${trendLabels.length - maxFit}개 추세선 생략)`, plotX0 + 16, ty);
+        }
+    }
+
+    return true;
+}
+
+// Format a value for axis labels — handles log scale and very large/small
+function fmtAxisVal(v, isLog) {
+    if (!Number.isFinite(v)) return '';
+    const abs = Math.abs(v);
+    if (isLog) {
+        // For log: prefer 10^k if it's close, else exponential
+        const lv = Math.log10(abs);
+        const k = Math.round(lv);
+        if (Math.abs(lv - k) < 0.05) return '10^' + k;
+        if (abs < 0.01 || abs >= 10000) return v.toExponential(1);
+        return v.toPrecision(2);
+    }
+    if (abs === 0) return '0';
+    if (abs < 0.01 || abs >= 100000) return v.toExponential(1);
+    if (abs < 1) return v.toFixed(3);
+    return v.toFixed(2);
+}
+
+// React component
+function DataTable({ value, onChange }) {
+    const canvasRef = useRef(null);
+    const dt = value && value.columns ? value : emptyDataTable();
+
+    // Re-render chart whenever data changes
+    useEffect(() => {
+        if (canvasRef.current) {
+            try { renderDataTableChart(canvasRef.current, dt); } catch (e) { console.error(e); }
+        }
+    }, [dt]);
+
+    // Cell edit
+    const editCell = (r, c, v) => {
+        const rows = dt.rows.map(row => row.slice());
+        if (!rows[r]) rows[r] = dt.columns.map(() => '');
+        rows[r][c] = v;
+        onChange({ ...dt, rows });
+    };
+    const editColName = (c, v) => {
+        const columns = dt.columns.slice();
+        columns[c] = v;
+        onChange({ ...dt, columns });
+    };
+    const addRow = () => {
+        const rows = dt.rows.map(row => row.slice());
+        rows.push(dt.columns.map(() => ''));
+        onChange({ ...dt, rows });
+    };
+    const removeRow = (i) => {
+        const rows = dt.rows.slice();
+        rows.splice(i, 1);
+        onChange({ ...dt, rows });
+    };
+    const addCol = () => {
+        const newColName = 'y' + dt.columns.length;
+        const columns = [...dt.columns, newColName];
+        const rows = dt.rows.map(row => [...row, '']);
+        // Default new column to y-series
+        const chart = { ...dt.chart };
+        if (!chart.yCols) chart.yCols = [];
+        chart.yCols = [...chart.yCols, columns.length - 1];
+        onChange({ ...dt, columns, rows, chart });
+    };
+    const removeCol = (c) => {
+        if (dt.columns.length <= 2) { alert('최소 2개의 열이 필요합니다.'); return; }
+        const columns = dt.columns.slice();
+        columns.splice(c, 1);
+        const rows = dt.rows.map(row => {
+            const next = row.slice();
+            next.splice(c, 1);
+            return next;
+        });
+        // Fix chart config
+        const chart = { ...dt.chart };
+        if (chart.xCol === c) chart.xCol = 0;
+        else if (chart.xCol > c) chart.xCol -= 1;
+        chart.yCols = (chart.yCols || [])
+            .filter(yc => yc !== c)
+            .map(yc => yc > c ? yc - 1 : yc);
+        onChange({ ...dt, columns, rows, chart });
+    };
+
+    const setChart = (patch) => onChange({ ...dt, chart: { ...dt.chart, ...patch } });
+    const toggleYCol = (c) => {
+        const cur = dt.chart.yCols || [];
+        const next = cur.includes(c) ? cur.filter(x => x !== c) : [...cur, c];
+        setChart({ yCols: next });
+    };
+
+    const ctrlStyle = {
+        padding: '6px 8px', border: '1px solid #d1d5db', borderRadius: 6,
+        fontSize: 13, background: 'white'
+    };
+
+    return React.createElement('div', { className: 'datatable-wrap' },
+        // ----- Editable table -----
+        React.createElement('div', { className: 'scroll-table' },
+            React.createElement('table', { className: 'ftbl no-stack', style: { minWidth: 480 } },
+                React.createElement('thead', null,
+                    React.createElement('tr', null,
+                        React.createElement('th', { style: { width: 60 } }, '#'),
+                        dt.columns.map((c, i) => React.createElement('th', { key: i, style: { minWidth: 100 } },
+                            React.createElement('input', {
+                                className: 'cell',
+                                value: c,
+                                onChange: e => editColName(i, e.target.value),
+                                style: { fontWeight: 700, textAlign: 'center', background: 'transparent' }
+                            }),
+                            dt.columns.length > 2 && React.createElement('button', {
+                                onClick: () => removeCol(i),
+                                style: { marginTop: 2, fontSize: 10, padding: '1px 6px', border: '1px solid #d1d5db', background: 'white', borderRadius: 4, cursor: 'pointer', color: '#dc2626' },
+                                title: '이 열 삭제'
+                            }, '✕ 열 삭제'))),
+                        React.createElement('th', { style: { width: 50 } }))),
+                React.createElement('tbody', null,
+                    dt.rows.map((row, r) => React.createElement('tr', { key: r },
+                        React.createElement('td', { className: 'label-left' }, r + 1),
+                        dt.columns.map((_, c) => React.createElement('td', { key: c },
+                            React.createElement('input', {
+                                className: 'cell',
+                                type: 'text',
+                                value: row[c] || '',
+                                onChange: e => editCell(r, c, e.target.value),
+                                style: { textAlign: 'right' }
+                            }))),
+                        React.createElement('td', null,
+                            React.createElement('button', {
+                                onClick: () => removeRow(r),
+                                style: { fontSize: 11, padding: '2px 6px', border: '1px solid #d1d5db', background: 'white', borderRadius: 4, cursor: 'pointer', color: '#dc2626' },
+                                title: '이 행 삭제'
+                            }, '✕'))))))),
+        // Row/column add buttons
+        React.createElement('div', { style: { marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' } },
+            React.createElement('button', { className: 'btn btn-secondary', onClick: addRow, style: { fontSize: 12 } }, '+ 행 추가'),
+            React.createElement('button', { className: 'btn btn-secondary', onClick: addCol, style: { fontSize: 12 } }, '+ 열 추가')),
+
+        // ----- Chart controls -----
+        React.createElement('div', { className: 'chart-controls', style: { marginTop: 16, padding: 12, background: '#f8fafc', borderRadius: 6, border: '1px solid #e5e7eb' } },
+            React.createElement('div', { style: { fontSize: 12, fontWeight: 700, marginBottom: 8, color: '#374151' } }, '📊 그래프 설정'),
+            React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', fontSize: 12 } },
+                React.createElement('label', null, '그래프 종류 ',
+                    React.createElement('select', {
+                        value: dt.chart.type, onChange: e => setChart({ type: e.target.value }),
+                        style: ctrlStyle
+                    },
+                        React.createElement('option', { value: 'none' }, '표시 안 함'),
+                        React.createElement('option', { value: 'scatter' }, '산점도 (점)'),
+                        React.createElement('option', { value: 'line' }, '꺾은선'),
+                        React.createElement('option', { value: 'bar' }, '막대그래프'))),
+                React.createElement('label', null, 'x축 열 ',
+                    React.createElement('select', {
+                        value: dt.chart.xCol, onChange: e => setChart({ xCol: parseInt(e.target.value, 10) }),
+                        style: ctrlStyle
+                    },
+                        dt.columns.map((c, i) => React.createElement('option', { key: i, value: i }, c)))),
+                React.createElement('span', { style: { color: '#6b7280' } }, 'y축 열 (다중 선택):'),
+                dt.columns.map((c, i) => i !== dt.chart.xCol && React.createElement('label', { key: i, style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+                    React.createElement('input', { type: 'checkbox', checked: (dt.chart.yCols || []).includes(i), onChange: () => toggleYCol(i) }),
+                    c))),
+            // ----- Trendline / curve fitting (only for scatter/line) -----
+            (dt.chart.type === 'scatter' || dt.chart.type === 'line') && React.createElement('div', { style: { marginTop: 10, paddingTop: 10, borderTop: '1px dashed #d1d5db' } },
+                React.createElement('div', { style: { fontSize: 12, fontWeight: 700, marginBottom: 6, color: '#374151' } }, '📈 추세선 / 곡선 맞춤'),
+                React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', fontSize: 12 } },
+                    React.createElement('label', null, '맞춤 종류 ',
+                        React.createElement('select', {
+                            value: dt.chart.trendline || 'none', onChange: e => setChart({ trendline: e.target.value }),
+                            style: ctrlStyle
+                        },
+                            ['none', 'linear', 'poly2', 'poly3', 'poly4', 'exp', 'power', 'log', 'ma3', 'ma5', 'ma7']
+                                .map(k => React.createElement('option', { key: k, value: k }, fitKindLabel(k))))),
+                    (dt.chart.trendline && dt.chart.trendline !== 'none') && (dt.chart.yCols || []).length > 1 &&
+                        React.createElement('label', null, '대상 시리즈 ',
+                            React.createElement('select', {
+                                value: dt.chart.trendSeries === undefined || dt.chart.trendSeries === 'all' ? 'all' : String(dt.chart.trendSeries),
+                                onChange: e => setChart({ trendSeries: e.target.value === 'all' ? 'all' : parseInt(e.target.value, 10) }),
+                                style: ctrlStyle
+                            },
+                                React.createElement('option', { value: 'all' }, '모든 y 시리즈'),
+                                (dt.chart.yCols || []).map((c, i) => React.createElement('option', { key: i, value: String(i) }, dt.columns[c] || ('y' + (i + 1)))))),
+                    (dt.chart.trendline && dt.chart.trendline !== 'none') && React.createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+                        React.createElement('input', { type: 'checkbox', checked: dt.chart.showEquation !== false, onChange: e => setChart({ showEquation: e.target.checked }) }),
+                        '방정식 + R² 표시')),
+                React.createElement('div', { style: { fontSize: 11, color: '#6b7280', marginTop: 6, lineHeight: 1.5 } },
+                    '※ 지수/거듭제곱/로그 맞춤은 적용 조건이 다릅니다: 지수 → y > 0, 거듭제곱 → x > 0, y > 0, 로그 → x > 0. 조건이 안 맞으면 해당 점은 자동으로 무시됩니다.')),
+            // ----- Advanced chart options -----
+            React.createElement('div', { style: { marginTop: 10, paddingTop: 10, borderTop: '1px dashed #d1d5db' } },
+                React.createElement('div', { style: { fontSize: 12, fontWeight: 700, marginBottom: 6, color: '#374151' } }, '⚙️ 그래프 옵션'),
+                React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center', fontSize: 12 } },
+                    React.createElement('label', null, '그래프 제목 ',
+                        React.createElement('input', {
+                            type: 'text', value: dt.chart.title || '',
+                            onChange: e => setChart({ title: e.target.value }),
+                            placeholder: '예: 온도에 따른 반응 속도',
+                            style: { ...ctrlStyle, width: 240 }
+                        }))),
+                React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', fontSize: 12, marginTop: 6 } },
+                    React.createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+                        React.createElement('input', { type: 'checkbox', checked: dt.chart.showGrid !== false, onChange: e => setChart({ showGrid: e.target.checked }) }),
+                        '격자'),
+                    (dt.chart.type === 'scatter' || dt.chart.type === 'line') && React.createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+                        React.createElement('input', { type: 'checkbox', checked: dt.chart.showPoints !== false, onChange: e => setChart({ showPoints: e.target.checked }) }),
+                        '데이터 점'),
+                    React.createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+                        React.createElement('input', { type: 'checkbox', checked: !!dt.chart.showLabels, onChange: e => setChart({ showLabels: e.target.checked }) }),
+                        '데이터 라벨 표시'),
+                    React.createElement('label', { style: { display: 'inline-flex', alignItems: 'center', gap: 4 } },
+                        React.createElement('input', { type: 'checkbox', checked: !!dt.chart.yLogScale, onChange: e => setChart({ yLogScale: e.target.checked }) }),
+                        'y축 로그 스케일')),
+                // Manual axis ranges
+                React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', fontSize: 12, marginTop: 6 } },
+                    React.createElement('span', { style: { color: '#6b7280' } }, '축 범위 (비워두면 자동):'),
+                    (dt.chart.type !== 'bar') && React.createElement(React.Fragment, null,
+                        React.createElement('label', null, 'x 최소 ',
+                            React.createElement('input', { type: 'text', value: dt.chart.xMinManual || '', onChange: e => setChart({ xMinManual: e.target.value }), style: { ...ctrlStyle, width: 70 } })),
+                        React.createElement('label', null, 'x 최대 ',
+                            React.createElement('input', { type: 'text', value: dt.chart.xMaxManual || '', onChange: e => setChart({ xMaxManual: e.target.value }), style: { ...ctrlStyle, width: 70 } }))),
+                    React.createElement('label', null, 'y 최소 ',
+                        React.createElement('input', { type: 'text', value: dt.chart.yMinManual || '', onChange: e => setChart({ yMinManual: e.target.value }), style: { ...ctrlStyle, width: 70 } })),
+                    React.createElement('label', null, 'y 최대 ',
+                        React.createElement('input', { type: 'text', value: dt.chart.yMaxManual || '', onChange: e => setChart({ yMaxManual: e.target.value }), style: { ...ctrlStyle, width: 70 } }))),
+                // Error bar column
+                React.createElement('div', { style: { display: 'flex', flexWrap: 'wrap', gap: 8, alignItems: 'center', fontSize: 12, marginTop: 6 } },
+                    React.createElement('label', null, '오차 막대 (± 값을 담은 열) ',
+                        React.createElement('select', {
+                            value: dt.chart.errorCol == null ? -1 : dt.chart.errorCol,
+                            onChange: e => setChart({ errorCol: parseInt(e.target.value, 10) }),
+                            style: ctrlStyle
+                        },
+                            React.createElement('option', { value: -1 }, '없음'),
+                            dt.columns.map((c, i) => React.createElement('option', { key: i, value: i }, c)))))
+            )),
+
+        // ----- Chart canvas -----
+        React.createElement('div', { className: 'chart-box', style: { marginTop: 12, padding: 8, background: 'white', borderRadius: 6, border: '1px solid #e5e7eb' } },
+            React.createElement('canvas', { ref: canvasRef, className: 'datatable-chart' }))
+    );
+}
+
+function emptyDataTableField() { return emptyDataTable(2, 5); }
+
+// =====================================================================
+// COMMON COVER + REFERENCES (used by multiple report types)
+// =====================================================================
+function CommonCoverSection({ data, set, kindLabel }) {
+    const c = data.cover || {};
     return React.createElement('div', null,
         React.createElement('div', { className: 'cover' },
-            React.createElement('div', { className: 'small-title' }, '실험 보고서'),
+            React.createElement('div', { className: 'small-title' }, kindLabel || '실험 보고서'),
             React.createElement('div', { style: { fontSize: 28, fontWeight: 700, color: 'var(--primary)', margin: '12px 0' } },
                 React.createElement(TextInput, { value: c.title, onChange: v => set(['cover', 'title'], v), placeholder: '제목을 입력하세요' })),
             React.createElement('div', { style: { fontSize: 14, color: '#6b7280' } },
@@ -3277,7 +4260,7 @@ function GenericCoverSection({ data, set }) {
                 React.createElement('col', null)),
             React.createElement('tbody', null,
                 React.createElement('tr', null,
-                    React.createElement('td', { className: 'label-left' }, '모둠명'),
+                    React.createElement('td', { className: 'label-left' }, '모둠 / 작성자'),
                     React.createElement('td', null,
                         React.createElement(TextInput, { value: c.group_name, onChange: v => set(['cover', 'group_name'], v), placeholder: '예: 1모둠' }))),
                 React.createElement('tr', null,
@@ -3289,257 +4272,968 @@ function GenericCoverSection({ data, set }) {
                     React.createElement('td', null,
                         React.createElement(TextInput, { value: c.teacher, onChange: v => set(['cover', 'teacher'], v) }))),
                 React.createElement('tr', null,
-                    React.createElement('td', { className: 'label-left' }, '실험 일자'),
+                    React.createElement('td', { className: 'label-left' }, '일자'),
                     React.createElement('td', null,
                         React.createElement(TextInput, { value: c.date, onChange: v => set(['cover', 'date'], v), placeholder: '2026-05-01' }))))));
 }
 
-function GenericMotivationSection({ data, set }) {
+function ReferencesSection({ data, set }) {
     return React.createElement('div', null,
-        React.createElement('div', { className: 'h1-blue' }, '1. 탐구 동기 및 문제 인식'),
-        React.createElement(Hint, null, '왜 이 실험을 하기로 했나요? 어떤 현상이나 궁금증에서 출발했나요?'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.motivation, onChange: v => set(['motivation'], v), big: true, huge: true }))))),
-        React.createElement(BulletH, null, '탐구 질문 (Research Question)'),
-        React.createElement(Hint, null, '한 문장의 질문으로 정리하세요.'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.research_question, onChange: v => set(['research_question'], v), big: true }))))));
+        React.createElement('div', { className: 'h1-blue' }, '참고문헌'),
+        React.createElement(Hint, null, '참고한 책·논문·웹사이트를 적습니다. 비워두어도 됩니다. 같은 양식으로 통일해 적으면 좋습니다.'),
+        React.createElement(NumberedList, {
+            items: data.references || ['', '', ''],
+            onChange: v => set(['references'], v),
+            label: '문헌'
+        }));
 }
 
-function GenericHypothesisSection({ data, set }) {
-    const v = data.variables;
+// ---------------------------------------------------------------------
+// RESULTS SECTION (shared) — text records + DataTable + optional photos
+// ---------------------------------------------------------------------
+function ResultsSection({ data, set, showPhotos = true }) {
+    const ph = data.photos || {};
     return React.createElement('div', null,
-        React.createElement('div', { className: 'h1-blue' }, '2. 가설 및 변인 정리'),
-        React.createElement(BulletH, null, '가설'),
-        React.createElement(Hint, null, '실험 결과를 예상해 보세요. 근거도 함께.'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.hypothesis, onChange: v2 => set(['hypothesis'], v2), big: true, huge: true }))))),
-        React.createElement(BulletH, null, '변인 정리'),
+        React.createElement('div', { className: 'h1-blue' }, '실험 결과'),
+        React.createElement(BulletH, null, '관찰·측정 내용 (글로 기록)'),
+        React.createElement(Hint, null, '수치로 표현되지 않는 관찰 내용을 자유롭게 기록하세요.'),
+        React.createElement(TextBlock, {
+            value: data.data_records,
+            onChange: v => set(['data_records'], v),
+            huge: true
+        }),
+        React.createElement(BulletH, null, '데이터 표 + 그래프'),
+        React.createElement(Hint, null, '표에 숫자를 입력하면 아래 그래프가 자동으로 그려집니다. 추세선(선형 회귀)도 켤 수 있어요.'),
+        React.createElement(DataTable, {
+            value: data.datatable,
+            onChange: v => set(['datatable'], v)
+        }),
+        showPhotos && React.createElement(React.Fragment, null,
+            React.createElement(BulletH, null, '실험 사진 (선택, 최대 4장)'),
+            React.createElement('table', { className: 'ftbl no-stack' },
+                React.createElement('tbody', null,
+                    React.createElement('tr', null,
+                        React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p1, onChange: v => set(['photos', 'p1'], v), label: '사진 1' })),
+                        React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p2, onChange: v => set(['photos', 'p2'], v), label: '사진 2' }))),
+                    React.createElement('tr', null,
+                        React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p3, onChange: v => set(['photos', 'p3'], v), label: '사진 3' })),
+                        React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p4, onChange: v => set(['photos', 'p4'], v), label: '사진 4' })))))));
+}
+
+// =====================================================================
+// 1. 기본 실험보고서 (BASIC)
+// =====================================================================
+const BASIC_EMPTY_DATA = {
+    cover: { title: '', subtitle: '', group_name: '', members: '', teacher: '', date: '' },
+    purpose: '',
+    materials: '',
+    safety: '',
+    procedure: ['', '', '', '', ''],
+    data_records: '',
+    datatable: emptyDataTable(2, 5),
+    photos: { p1: '', p2: '', p3: '', p4: '' },
+    interpretation: '',
+    conclusion: '',
+    extra_question: '',
+    roles: '',
+    reflection: '',
+    references: ['', '', ''],
+};
+
+function BasicCoverSection({ data, set }) {
+    return CommonCoverSection({ data, set, kindLabel: '기본 실험보고서' });
+}
+
+function BasicPurposeSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '1. 실험 목적'),
+        React.createElement(Hint, null, '왜 이 실험을 하는지, 무엇을 확인하려는지 짧게 적습니다.'),
+        React.createElement(TextBlock, { value: data.purpose, onChange: v => set(['purpose'], v), huge: false }));
+}
+
+function BasicProcedureSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '2. 준비물 · 안전 · 실험 과정'),
+        React.createElement(BulletH, null, '준비물'),
+        React.createElement(TextBlock, { value: data.materials, onChange: v => set(['materials'], v), placeholder: '실험에 필요한 모든 재료·기구·시약', huge: false }),
+        React.createElement(BulletH, null, '안전 유의사항'),
+        React.createElement(Hint, null, '날카로운 도구, 가열, 화학약품, 보호장비 등 주의할 점.'),
+        React.createElement(TextBlock, { value: data.safety, onChange: v => set(['safety'], v), huge: false }),
+        React.createElement(BulletH, null, '실험 과정 (단계별)'),
+        React.createElement(Hint, null, '다른 모둠이 그대로 따라서 재현할 수 있을 만큼 구체적으로.'),
+        React.createElement(NumberedList, {
+            items: data.procedure,
+            onChange: v => set(['procedure'], v),
+            label: 'Step'
+        }));
+}
+
+function BasicResultsSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '3. 실험 결과'),
+        React.createElement(ResultsSection, { data, set }));
+}
+
+function BasicAnalysisSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '4. 결과 해석 및 결론'),
+        React.createElement(BulletH, null, '결과 해석'),
+        React.createElement(Hint, null, '데이터에서 어떤 패턴이 보였나요? 예상과 같았나요?'),
+        React.createElement(TextBlock, { value: data.interpretation, onChange: v => set(['interpretation'], v) }),
+        React.createElement(BulletH, null, '결론'),
+        React.createElement(Hint, null, '실험 목적에 대한 답을 한두 문장으로 명확하게.'),
+        React.createElement(TextBlock, { value: data.conclusion, onChange: v => set(['conclusion'], v), huge: false }));
+}
+
+function BasicOptionalSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '5. (선택) 더 알아본 것 · 역할 · 느낀 점'),
+        React.createElement(BulletH, null, '의문점 / 추가 탐구 거리'),
+        React.createElement(TextBlock, { value: data.extra_question, onChange: v => set(['extra_question'], v), huge: false }),
+        React.createElement(BulletH, null, '모둠원 역할 분담'),
+        React.createElement(TextBlock, { value: data.roles, onChange: v => set(['roles'], v), huge: false }),
+        React.createElement(BulletH, null, '느낀 점'),
+        React.createElement(TextBlock, { value: data.reflection, onChange: v => set(['reflection'], v), huge: false }));
+}
+
+const BASIC_SECTIONS = [
+    { id: 'cover', label: '표지', comp: BasicCoverSection },
+    { id: 'purpose', label: '1. 목적', comp: BasicPurposeSection },
+    { id: 'procedure', label: '2. 준비·과정', comp: BasicProcedureSection },
+    { id: 'results', label: '3. 결과', comp: BasicResultsSection },
+    { id: 'analysis', label: '4. 해석·결론', comp: BasicAnalysisSection },
+    { id: 'optional', label: '5. (선택)', comp: BasicOptionalSection },
+    { id: 'references', label: '참고문헌', comp: ReferencesSection },
+];
+
+// =====================================================================
+// 2. 가설검증 보고서 (HYPOTHESIS)
+// =====================================================================
+const HYPOTHESIS_EMPTY_DATA = {
+    cover: { title: '', subtitle: '', group_name: '', members: '', teacher: '', date: '' },
+    research_question: '',
+    hypothesis: '',
+    variables: { independent: '', dependent: '', controlled: '', control_method: '' },
+    purpose: '',
+    materials: '',
+    safety: '',
+    procedure: ['', '', '', '', ''],
+    data_records: '',
+    datatable: emptyDataTable(2, 5),
+    photos: { p1: '', p2: '', p3: '', p4: '' },
+    interpretation: '',
+    judgment: '',  // 채택 / 기각
+    claim: '',  // 결론을 논증 형식으로
+    evidence: '',
+    reasoning: '',
+    alt_interpretation: '',
+    references: ['', '', ''],
+};
+
+function HypothesisCoverSection({ data, set }) {
+    return CommonCoverSection({ data, set, kindLabel: '가설검증 보고서' });
+}
+
+function HypothesisQuestionSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '1. 탐구 문제 · 가설 · 변인'),
+        React.createElement(BulletH, null, '탐구 문제 (질문 형식)'),
+        React.createElement(Hint, null, '예: "온도가 올라가면 효소의 반응 속도는 어떻게 변할까?"'),
+        React.createElement(TextBlock, { value: data.research_question, onChange: v => set(['research_question'], v), huge: false }),
+        React.createElement(BulletH, null, '가설 (검증 가능한 진술)'),
+        React.createElement(Hint, null, '예: "온도가 10℃ 오를 때마다 효소 반응 속도가 약 2배가 될 것이다."'),
+        React.createElement(TextBlock, { value: data.hypothesis, onChange: v => set(['hypothesis'], v), huge: false }),
+        React.createElement(BulletH, null, '변인 설정'),
         React.createElement('table', { className: 'ftbl' },
             React.createElement('colgroup', null,
-                React.createElement('col', { style: { width: '160px' } }),
+                React.createElement('col', { style: { width: '140px' } }),
                 React.createElement('col', null)),
             React.createElement('tbody', null,
                 React.createElement('tr', null,
-                    React.createElement('td', { className: 'label-left' }, '독립 변인'),
-                    React.createElement('td', { 'data-label': '독립 변인 (내가 바꾸는 변인)' },
-                        React.createElement(TextArea, { value: v.independent, onChange: x => set(['variables', 'independent'], x), placeholder: '예: 용액의 온도 (10, 20, 30, 40 ℃)' }))),
+                    React.createElement('td', { className: 'label-left' }, '조작 변인'),
+                    React.createElement('td', { 'data-label': '조작 변인 (내가 바꾸는 변인)' },
+                        React.createElement(TextArea, { value: data.variables.independent, onChange: x => set(['variables', 'independent'], x), placeholder: '예: 용액의 온도 (10, 20, 30, 40 ℃)' }))),
                 React.createElement('tr', null,
                     React.createElement('td', { className: 'label-left' }, '종속 변인'),
                     React.createElement('td', { 'data-label': '종속 변인 (관찰·측정)' },
-                        React.createElement(TextArea, { value: v.dependent, onChange: x => set(['variables', 'dependent'], x), placeholder: '예: 단위 시간당 반응 속도' }))),
+                        React.createElement(TextArea, { value: data.variables.dependent, onChange: x => set(['variables', 'dependent'], x), placeholder: '예: 단위 시간당 반응 속도' }))),
                 React.createElement('tr', null,
                     React.createElement('td', { className: 'label-left' }, '통제 변인'),
                     React.createElement('td', { 'data-label': '통제 변인 (일정하게 유지)' },
-                        React.createElement(TextArea, { value: v.controlled, onChange: x => set(['variables', 'controlled'], x), placeholder: '예: pH, 반응 시간' }))))));
+                        React.createElement(TextArea, { value: data.variables.controlled, onChange: x => set(['variables', 'controlled'], x), placeholder: '예: pH, 효소 농도, 반응 시간' }))),
+                React.createElement('tr', null,
+                    React.createElement('td', { className: 'label-left' }, '통제 방법 (선택)'),
+                    React.createElement('td', { 'data-label': '통제 변인을 어떻게 일정하게 유지했는지' },
+                        React.createElement(TextArea, { value: data.variables.control_method, onChange: x => set(['variables', 'control_method'], x), placeholder: '예: 항온수조 사용, 동일한 농도의 효소 사용' }))))));
 }
 
-function GenericProcedureSection({ data, set }) {
+function HypothesisProcedureSection({ data, set }) {
     return React.createElement('div', null,
-        React.createElement('div', { className: 'h1-blue' }, '3. 준비물 및 실험 방법'),
+        React.createElement('div', { className: 'h1-blue' }, '2. 실험 목적 · 준비 · 과정'),
+        React.createElement(BulletH, null, '실험 목적'),
+        React.createElement(TextBlock, { value: data.purpose, onChange: v => set(['purpose'], v), huge: false }),
         React.createElement(BulletH, null, '준비물'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.materials, onChange: v => set(['materials'], v), big: true, placeholder: '실험에 필요한 모든 재료·기구·시약을 적습니다.' }))))),
-        React.createElement(BulletH, null, '실험 방법 (단계별)'),
-        React.createElement(Hint, null, '다른 모둠이 그대로 따라서 재현할 수 있을 정도로 구체적으로 작성하세요.'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('colgroup', null,
-                React.createElement('col', { style: { width: '90px' } }),
-                React.createElement('col', null)),
-            React.createElement('tbody', null,
-                data.procedure.map((s, i) => React.createElement('tr', { key: i },
-                    React.createElement('td', { className: 'label-left' }, 'Step ', i + 1),
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: s, onChange: v => set(['procedure', i], v) })))))));
+        React.createElement(TextBlock, { value: data.materials, onChange: v => set(['materials'], v), huge: false }),
+        React.createElement(BulletH, null, '안전 유의사항'),
+        React.createElement(TextBlock, { value: data.safety, onChange: v => set(['safety'], v), huge: false }),
+        React.createElement(BulletH, null, '실험 과정'),
+        React.createElement(NumberedList, {
+            items: data.procedure,
+            onChange: v => set(['procedure'], v),
+            label: 'Step'
+        }));
 }
 
-function GenericResultsSection({ data, set }) {
-    const ph = data.photos;
+function HypothesisResultsSection({ data, set }) {
     return React.createElement('div', null,
-        React.createElement('div', { className: 'h1-blue' }, '4. 실험 결과'),
-        React.createElement(BulletH, null, '관찰·측정 데이터'),
-        React.createElement(Hint, null, '표, 수치, 관찰 결과를 자유롭게 기록하세요.'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.data_records, onChange: v => set(['data_records'], v), big: true, huge: true }))))),
-        React.createElement(BulletH, null, '실험 사진 (선택, 최대 4장)'),
+        React.createElement('div', { className: 'h1-blue' }, '3. 실험 결과'),
+        React.createElement(ResultsSection, { data, set }));
+}
+
+function HypothesisJudgmentSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '4. 결과 해석 · 가설 판단'),
+        React.createElement(BulletH, null, '결과 해석'),
+        React.createElement(TextBlock, { value: data.interpretation, onChange: v => set(['interpretation'], v) }),
+        React.createElement(BulletH, null, '가설 채택 / 기각 판단'),
+        React.createElement(Hint, null, '결과가 가설을 지지하는지, 기각하는지, 부분적으로만 지지하는지 명시하세요.'),
+        React.createElement(TextBlock, { value: data.judgment, onChange: v => set(['judgment'], v), huge: false }));
+}
+
+function HypothesisConclusionSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '5. 결론 (논증 형식 — 선택)'),
+        React.createElement(Hint, null, '주장–근거–추론(논증 보고서) 형식으로 결론을 정리하면 좋습니다. 단순 결론으로 끝내도 무방.'),
+        React.createElement(BulletH, null, '주장 (Claim)'),
+        React.createElement(Hint, null, '실험 결과 결국 무엇을 주장하는가?'),
+        React.createElement(TextBlock, { value: data.claim, onChange: v => set(['claim'], v), huge: false }),
+        React.createElement(BulletH, null, '근거 (Evidence)'),
+        React.createElement(Hint, null, '어떤 데이터·관찰이 이 주장을 뒷받침하는가?'),
+        React.createElement(TextBlock, { value: data.evidence, onChange: v => set(['evidence'], v) }),
+        React.createElement(BulletH, null, '추론 (Reasoning)'),
+        React.createElement(Hint, null, '근거가 왜 그런 주장으로 이어지는가? 과학적 원리·이론과 연결.'),
+        React.createElement(TextBlock, { value: data.reasoning, onChange: v => set(['reasoning'], v) }),
+        React.createElement(BulletH, null, '대안 해석 검토 (선택)'),
+        React.createElement(Hint, null, '같은 결과를 다르게 해석할 수 있다면? 왜 그 해석보다 우리 해석이 더 타당한가?'),
+        React.createElement(TextBlock, { value: data.alt_interpretation, onChange: v => set(['alt_interpretation'], v), huge: false }));
+}
+
+const HYPOTHESIS_SECTIONS = [
+    { id: 'cover', label: '표지', comp: HypothesisCoverSection },
+    { id: 'question', label: '1. 문제·가설·변인', comp: HypothesisQuestionSection },
+    { id: 'procedure', label: '2. 목적·준비·과정', comp: HypothesisProcedureSection },
+    { id: 'results', label: '3. 결과', comp: HypothesisResultsSection },
+    { id: 'judgment', label: '4. 해석·판단', comp: HypothesisJudgmentSection },
+    { id: 'conclusion', label: '5. 결론', comp: HypothesisConclusionSection },
+    { id: 'references', label: '참고문헌', comp: ReferencesSection },
+];
+
+// =====================================================================
+// 3. 자유탐구 보고서 (FREE)
+// =====================================================================
+const FREE_EMPTY_DATA = {
+    cover: { title: '', subtitle: '', group_name: '', members: '', teacher: '', date: '' },
+    motivation: '',
+    background: '',
+    research_question: '',
+    hypothesis: '',
+    design: '',
+    expected: '',
+    materials: '',
+    procedure: ['', '', '', '', ''],
+    data_records: '',
+    datatable: emptyDataTable(2, 5),
+    photos: { p1: '', p2: '', p3: '', p4: '' },
+    iteration: '',
+    interpretation: '',
+    conclusion: '',
+    claim: '',
+    evidence: '',
+    reasoning: '',
+    next_step: '',
+    references: ['', '', ''],
+};
+
+function FreeCoverSection({ data, set }) {
+    return CommonCoverSection({ data, set, kindLabel: '자유탐구 보고서' });
+}
+
+function FreeMotivationSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '1. 주제 선정 · 배경'),
+        React.createElement(BulletH, null, '탐구 주제 선정 동기'),
+        React.createElement(Hint, null, '왜 이 주제를 선택했는지, 어떤 현상이나 의문에서 출발했는지.'),
+        React.createElement(TextBlock, { value: data.motivation, onChange: v => set(['motivation'], v) }),
+        React.createElement(BulletH, null, '사전 조사 (간단한 배경)'),
+        React.createElement(Hint, null, '관련된 과학 개념·원리를 간단히 정리.'),
+        React.createElement(TextBlock, { value: data.background, onChange: v => set(['background'], v) }));
+}
+
+function FreeQuestionSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '2. 탐구 문제 · 가설 · 설계'),
+        React.createElement(BulletH, null, '탐구 문제'),
+        React.createElement(TextBlock, { value: data.research_question, onChange: v => set(['research_question'], v), huge: false }),
+        React.createElement(BulletH, null, '가설'),
+        React.createElement(TextBlock, { value: data.hypothesis, onChange: v => set(['hypothesis'], v), huge: false }),
+        React.createElement(BulletH, null, '탐구 설계 (직접 설계)'),
+        React.createElement(Hint, null, '어떤 변인을 다룰지, 어떻게 측정·관찰할지를 학생이 직접 설계합니다.'),
+        React.createElement(TextBlock, { value: data.design, onChange: v => set(['design'], v) }),
+        React.createElement(BulletH, null, '예상 결과 (선택)'),
+        React.createElement(TextBlock, { value: data.expected, onChange: v => set(['expected'], v), huge: false }));
+}
+
+function FreeProcedureSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '3. 준비물 · 탐구 과정'),
+        React.createElement(BulletH, null, '준비물'),
+        React.createElement(TextBlock, { value: data.materials, onChange: v => set(['materials'], v), huge: false }),
+        React.createElement(BulletH, null, '탐구 과정'),
+        React.createElement(NumberedList, {
+            items: data.procedure,
+            onChange: v => set(['procedure'], v),
+            label: 'Step'
+        }));
+}
+
+function FreeResultsSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '4. 결과'),
+        React.createElement(ResultsSection, { data, set }),
+        React.createElement(BulletH, null, '시행착오 / 설계 변경 기록 (선택)'),
+        React.createElement(Hint, null, '탐구 도중 무엇이 잘 안 되어 어떻게 바꿨는지.'),
+        React.createElement(TextBlock, { value: data.iteration, onChange: v => set(['iteration'], v) }));
+}
+
+function FreeAnalysisSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '5. 결과 해석 및 결론'),
+        React.createElement(BulletH, null, '결과 해석'),
+        React.createElement(TextBlock, { value: data.interpretation, onChange: v => set(['interpretation'], v) }),
+        React.createElement(BulletH, null, '결론'),
+        React.createElement(TextBlock, { value: data.conclusion, onChange: v => set(['conclusion'], v), huge: false }),
+        React.createElement(BulletH, null, '논증형 결론 (선택)'),
+        React.createElement(Hint, null, '주장–근거–추론 형식으로 정리하고 싶다면 아래 칸을 채우세요.'),
+        React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr', gap: 6 } },
+            React.createElement('label', { style: { fontSize: 12, fontWeight: 600 } }, '주장 (Claim)'),
+            React.createElement(TextBlock, { value: data.claim, onChange: v => set(['claim'], v), huge: false }),
+            React.createElement('label', { style: { fontSize: 12, fontWeight: 600 } }, '근거 (Evidence)'),
+            React.createElement(TextBlock, { value: data.evidence, onChange: v => set(['evidence'], v), huge: false }),
+            React.createElement('label', { style: { fontSize: 12, fontWeight: 600 } }, '추론 (Reasoning)'),
+            React.createElement(TextBlock, { value: data.reasoning, onChange: v => set(['reasoning'], v), huge: false })),
+        React.createElement(BulletH, null, '후속 탐구 아이디어 (선택)'),
+        React.createElement(TextBlock, { value: data.next_step, onChange: v => set(['next_step'], v), huge: false }));
+}
+
+const FREE_SECTIONS = [
+    { id: 'cover', label: '표지', comp: FreeCoverSection },
+    { id: 'motivation', label: '1. 주제·배경', comp: FreeMotivationSection },
+    { id: 'question', label: '2. 문제·가설·설계', comp: FreeQuestionSection },
+    { id: 'procedure', label: '3. 준비·과정', comp: FreeProcedureSection },
+    { id: 'results', label: '4. 결과', comp: FreeResultsSection },
+    { id: 'analysis', label: '5. 해석·결론', comp: FreeAnalysisSection },
+    { id: 'references', label: '참고문헌', comp: ReferencesSection },
+];
+
+// =====================================================================
+// 4. 심화탐구 보고서 (ADVANCED)
+// =====================================================================
+const ADVANCED_EMPTY_DATA = {
+    cover: { title: '', subtitle: '', group_name: '', members: '', teacher: '', date: '' },
+    problem_context: '',
+    research_question: '',
+    prior_research: '',
+    theory_background: '',
+    hypothesis: '',
+    design_variables: '',
+    design_measurement: '',
+    design_analysis: '',
+    procedure: ['', '', '', '', ''],
+    data_records: '',
+    datatable: emptyDataTable(2, 5),
+    photos: { p1: '', p2: '', p3: '', p4: '' },
+    statistics: '',
+    interpretation: '',
+    conclusion: '',
+    significance: '',
+    limitations: '',
+    next_step: '',
+    references: ['', '', '', '', ''],
+};
+
+function AdvancedCoverSection({ data, set }) {
+    return CommonCoverSection({ data, set, kindLabel: '심화탐구 보고서' });
+}
+
+function AdvancedIntroSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '1. 문제 상황 · 탐구 문제 · 선행연구'),
+        React.createElement(BulletH, null, '문제 상황'),
+        React.createElement(Hint, null, '이 탐구가 등장하게 된 맥락, 배경 문제.'),
+        React.createElement(TextBlock, { value: data.problem_context, onChange: v => set(['problem_context'], v) }),
+        React.createElement(BulletH, null, '탐구 문제'),
+        React.createElement(TextBlock, { value: data.research_question, onChange: v => set(['research_question'], v), huge: false }),
+        React.createElement(BulletH, null, '선행연구 분석'),
+        React.createElement(Hint, null, '관련 논문·연구 결과를 요약·인용합니다. 출처를 명시하세요.'),
+        React.createElement(TextBlock, { value: data.prior_research, onChange: v => set(['prior_research'], v) }),
+        React.createElement(BulletH, null, '이론적 배경 (선택)'),
+        React.createElement(Hint, null, '선행연구와 분리하여 별도로 이론을 정리합니다.'),
+        React.createElement(TextBlock, { value: data.theory_background, onChange: v => set(['theory_background'], v) }));
+}
+
+function AdvancedDesignSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '2. 가설 / 연구 질문 · 탐구 설계'),
+        React.createElement(BulletH, null, '가설 또는 연구 질문'),
+        React.createElement(TextBlock, { value: data.hypothesis, onChange: v => set(['hypothesis'], v), huge: false }),
+        React.createElement(BulletH, null, '변인 설정'),
+        React.createElement(TextBlock, { value: data.design_variables, onChange: v => set(['design_variables'], v) }),
+        React.createElement(BulletH, null, '측정 방법'),
+        React.createElement(TextBlock, { value: data.design_measurement, onChange: v => set(['design_measurement'], v) }),
+        React.createElement(BulletH, null, '분석 방법'),
+        React.createElement(Hint, null, '통계 분석을 한다면 어떤 방법을 쓸지 적습니다.'),
+        React.createElement(TextBlock, { value: data.design_analysis, onChange: v => set(['design_analysis'], v) }));
+}
+
+function AdvancedProcessSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '3. 탐구 과정'),
+        React.createElement(NumberedList, {
+            items: data.procedure,
+            onChange: v => set(['procedure'], v),
+            label: 'Step'
+        }));
+}
+
+function AdvancedResultsSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '4. 탐구 결과'),
+        React.createElement(ResultsSection, { data, set }),
+        React.createElement(BulletH, null, '통계적 처리 (선택)'),
+        React.createElement(Hint, null, '평균, 표준편차, t-검정 등 적용한 통계 처리 결과를 적습니다.'),
+        React.createElement(TextBlock, { value: data.statistics, onChange: v => set(['statistics'], v) }));
+}
+
+function AdvancedDiscussionSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '5. 결과 해석 · 결론 · 의의'),
+        React.createElement(BulletH, null, '결과 해석'),
+        React.createElement(TextBlock, { value: data.interpretation, onChange: v => set(['interpretation'], v) }),
+        React.createElement(BulletH, null, '결론'),
+        React.createElement(TextBlock, { value: data.conclusion, onChange: v => set(['conclusion'], v), huge: false }),
+        React.createElement(BulletH, null, '탐구의 의의 (선택)'),
+        React.createElement(TextBlock, { value: data.significance, onChange: v => set(['significance'], v), huge: false }),
+        React.createElement(BulletH, null, '한계 (선택)'),
+        React.createElement(TextBlock, { value: data.limitations, onChange: v => set(['limitations'], v), huge: false }),
+        React.createElement(BulletH, null, '후속 탐구 제안 (선택)'),
+        React.createElement(TextBlock, { value: data.next_step, onChange: v => set(['next_step'], v), huge: false }));
+}
+
+const ADVANCED_SECTIONS = [
+    { id: 'cover', label: '표지', comp: AdvancedCoverSection },
+    { id: 'intro', label: '1. 문제·선행연구', comp: AdvancedIntroSection },
+    { id: 'design', label: '2. 가설·설계', comp: AdvancedDesignSection },
+    { id: 'process', label: '3. 탐구 과정', comp: AdvancedProcessSection },
+    { id: 'results', label: '4. 결과', comp: AdvancedResultsSection },
+    { id: 'discussion', label: '5. 해석·결론', comp: AdvancedDiscussionSection },
+    { id: 'references', label: '참고문헌', comp: ReferencesSection },
+];
+
+// =====================================================================
+// 5. 공학설계 보고서 (ENGINEERING)
+// =====================================================================
+const ENGINEERING_EMPTY_DATA = {
+    cover: { title: '', subtitle: '', group_name: '', members: '', teacher: '', date: '' },
+    problem_def: '',
+    constraints: '',
+    science_principle: '',
+    ideas: ['', '', ''],
+    alternatives_compare: '',
+    selected_design: '',
+    selection_reason: '',
+    design_drawing: '',
+    drawing_image: '',
+    build_test: '',
+    datatable: emptyDataTable(2, 5),
+    data_records: '',
+    photos: { p1: '', p2: '', p3: '', p4: '' },
+    improvements: '',
+    final_conclusion: '',
+    cost_time: '',
+    applicability: '',
+    safety_review: '',
+    references: ['', '', ''],
+};
+
+function EngineeringCoverSection({ data, set }) {
+    return CommonCoverSection({ data, set, kindLabel: '공학설계 보고서' });
+}
+
+function EngineeringProblemSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '1. 문제 정의 · 관련 원리'),
+        React.createElement(BulletH, null, '문제 정의 (요구 사항)'),
+        React.createElement(Hint, null, '해결해야 할 문제는? 사용자 / 사용 환경 / 필수 기능은?'),
+        React.createElement(TextBlock, { value: data.problem_def, onChange: v => set(['problem_def'], v) }),
+        React.createElement(BulletH, null, '제약 조건'),
+        React.createElement(Hint, null, '예산, 사용 가능한 재료, 크기·무게 한계, 시간 등.'),
+        React.createElement(TextBlock, { value: data.constraints, onChange: v => set(['constraints'], v) }),
+        React.createElement(BulletH, null, '관련 과학 개념·원리'),
+        React.createElement(TextBlock, { value: data.science_principle, onChange: v => set(['science_principle'], v) }));
+}
+
+function EngineeringIdeaSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '2. 아이디어 도출 · 대안 비교 · 선정'),
+        React.createElement(BulletH, null, '아이디어 도출 (여러 안)'),
+        React.createElement(NumberedList, {
+            items: data.ideas,
+            onChange: v => set(['ideas'], v),
+            label: '아이디어'
+        }),
+        React.createElement(BulletH, null, '대안 비교'),
+        React.createElement(Hint, null, '각 아이디어의 장단점·예상 성능을 비교합니다. 표로 정리하면 좋습니다.'),
+        React.createElement(TextBlock, { value: data.alternatives_compare, onChange: v => set(['alternatives_compare'], v) }),
+        React.createElement(BulletH, null, '선정된 설계안'),
+        React.createElement(TextBlock, { value: data.selected_design, onChange: v => set(['selected_design'], v), huge: false }),
+        React.createElement(BulletH, null, '선정 기준과 근거'),
+        React.createElement(TextBlock, { value: data.selection_reason, onChange: v => set(['selection_reason'], v) }));
+}
+
+function EngineeringDesignSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '3. 설계도 · 모델'),
+        React.createElement(BulletH, null, '설계 설명'),
+        React.createElement(TextBlock, { value: data.design_drawing, onChange: v => set(['design_drawing'], v) }),
+        React.createElement(BulletH, null, '설계도 이미지 (선택)'),
+        React.createElement(Hint, null, '손으로 그린 설계도를 사진 찍어 올리거나, 디지털 도면을 업로드.'),
+        React.createElement(ImageUpload, { value: data.drawing_image, onChange: v => set(['drawing_image'], v), label: '설계도' }));
+}
+
+function EngineeringTestSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, '4. 제작 · 시험 · 데이터'),
+        React.createElement(BulletH, null, '제작 및 시험 결과 (글로 기록)'),
+        React.createElement(TextBlock, { value: data.build_test, onChange: v => set(['build_test'], v) }),
+        React.createElement(BulletH, null, '시험 데이터 표 + 그래프'),
+        React.createElement(Hint, null, '성능 측정 데이터를 표로 입력하면 그래프가 자동으로 그려집니다.'),
+        React.createElement(DataTable, { value: data.datatable, onChange: v => set(['datatable'], v) }),
+        React.createElement(BulletH, null, '관찰 기록 (글)'),
+        React.createElement(TextBlock, { value: data.data_records, onChange: v => set(['data_records'], v) }),
+        React.createElement(BulletH, null, '제작 사진 (선택, 최대 4장)'),
         React.createElement('table', { className: 'ftbl no-stack' },
             React.createElement('tbody', null,
                 React.createElement('tr', null,
-                    React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p1, onChange: v => set(['photos', 'p1'], v), label: '사진 1' })),
-                    React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p2, onChange: v => set(['photos', 'p2'], v), label: '사진 2' }))),
+                    React.createElement('td', null, React.createElement(ImageUpload, { value: (data.photos || {}).p1, onChange: v => set(['photos', 'p1'], v), label: '사진 1' })),
+                    React.createElement('td', null, React.createElement(ImageUpload, { value: (data.photos || {}).p2, onChange: v => set(['photos', 'p2'], v), label: '사진 2' }))),
                 React.createElement('tr', null,
-                    React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p3, onChange: v => set(['photos', 'p3'], v), label: '사진 3' })),
-                    React.createElement('td', null, React.createElement(ImageUpload, { value: ph.p4, onChange: v => set(['photos', 'p4'], v), label: '사진 4' }))))));
+                    React.createElement('td', null, React.createElement(ImageUpload, { value: (data.photos || {}).p3, onChange: v => set(['photos', 'p3'], v), label: '사진 3' })),
+                    React.createElement('td', null, React.createElement(ImageUpload, { value: (data.photos || {}).p4, onChange: v => set(['photos', 'p4'], v), label: '사진 4' }))))));
 }
 
-function GenericAnalysisSection({ data, set }) {
+function EngineeringConclusionSection({ data, set }) {
     return React.createElement('div', null,
-        React.createElement('div', { className: 'h1-blue' }, '5. 분석 및 결론'),
-        React.createElement(BulletH, null, '결과 분석'),
-        React.createElement(Hint, null, '데이터에서 어떤 패턴이 보였나요? 예상과 같았나요?'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.analysis, onChange: v => set(['analysis'], v), big: true, huge: true }))))),
-        React.createElement(BulletH, null, '결론'),
-        React.createElement(Hint, null, '탐구 질문에 대한 답을 한두 문장으로. 가설이 옳았는지도 함께.'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.conclusion, onChange: v => set(['conclusion'], v), big: true }))))),
-        React.createElement(BulletH, null, '느낀 점 · 한계 · 더 알아보고 싶은 것'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('tbody', null,
-                React.createElement('tr', null,
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: data.reflection, onChange: v => set(['reflection'], v), big: true, huge: true }))))));
+        React.createElement('div', { className: 'h1-blue' }, '5. 개선 · 최종 결론 · 평가'),
+        React.createElement(BulletH, null, '개선 사항 (반복 설계)'),
+        React.createElement(Hint, null, '1차 시제품의 문제점과 2차 개선 사항을 정리합니다.'),
+        React.createElement(TextBlock, { value: data.improvements, onChange: v => set(['improvements'], v) }),
+        React.createElement(BulletH, null, '최종 결론'),
+        React.createElement(TextBlock, { value: data.final_conclusion, onChange: v => set(['final_conclusion'], v) }),
+        React.createElement(BulletH, null, '비용·시간 분석 (선택)'),
+        React.createElement(TextBlock, { value: data.cost_time, onChange: v => set(['cost_time'], v), huge: false }),
+        React.createElement(BulletH, null, '적용 가능성 (선택)'),
+        React.createElement(TextBlock, { value: data.applicability, onChange: v => set(['applicability'], v), huge: false }),
+        React.createElement(BulletH, null, '안전성 검토 (선택)'),
+        React.createElement(TextBlock, { value: data.safety_review, onChange: v => set(['safety_review'], v), huge: false }));
 }
 
-function GenericReferencesSection({ data, set }) {
-    return React.createElement('div', null,
-        React.createElement('div', { className: 'h1-blue' }, '6. 참고문헌'),
-        React.createElement(Hint, null, '참고한 책·논문·웹사이트를 적습니다. 비워두어도 됩니다.'),
-        React.createElement('table', { className: 'ftbl' },
-            React.createElement('colgroup', null,
-                React.createElement('col', { style: { width: '70px' } }),
-                React.createElement('col', null)),
-            React.createElement('tbody', null,
-                data.references.map((r, i) => React.createElement('tr', { key: i },
-                    React.createElement('td', { className: 'label-left' }, i + 1),
-                    React.createElement('td', null,
-                        React.createElement(TextArea, { value: r, onChange: v => set(['references', i], v) })))))));
-}
-
-const GENERIC_SECTIONS = [
-    { id: 'cover', label: '표지', comp: GenericCoverSection },
-    { id: 'motivation', label: '1. 동기·질문', comp: GenericMotivationSection },
-    { id: 'hypothesis', label: '2. 가설·변인', comp: GenericHypothesisSection },
-    { id: 'procedure', label: '3. 방법', comp: GenericProcedureSection },
-    { id: 'results', label: '4. 결과', comp: GenericResultsSection },
-    { id: 'analysis', label: '5. 분석·결론', comp: GenericAnalysisSection },
-    { id: 'references', label: '6. 참고문헌', comp: GenericReferencesSection },
+const ENGINEERING_SECTIONS = [
+    { id: 'cover', label: '표지', comp: EngineeringCoverSection },
+    { id: 'problem', label: '1. 문제·원리', comp: EngineeringProblemSection },
+    { id: 'idea', label: '2. 아이디어·선정', comp: EngineeringIdeaSection },
+    { id: 'design', label: '3. 설계도', comp: EngineeringDesignSection },
+    { id: 'test', label: '4. 제작·시험', comp: EngineeringTestSection },
+    { id: 'conclusion', label: '5. 개선·결론', comp: EngineeringConclusionSection },
+    { id: 'references', label: '참고문헌', comp: ReferencesSection },
 ];
 
-function computeGenericProgress(data) {
+// =====================================================================
+// PROGRESS CALCULATOR (shared)
+// =====================================================================
+function computeReportProgress(data, requiredFields) {
     let total = 0, filled = 0;
-    const fields = [
-        data.cover?.title, data.cover?.group_name, data.cover?.members,
-        data.motivation, data.research_question, data.hypothesis,
-        data.variables?.independent, data.variables?.dependent, data.variables?.controlled,
-        data.materials, data.data_records, data.analysis, data.conclusion,
-    ];
-    for (const v of fields) { total++; if (v && String(v).trim().length > 5) filled++; }
-    for (const p of (data.procedure || [])) { total++; if (p && p.trim()) filled++; }
+    for (const path of requiredFields) {
+        total++;
+        // path is array
+        let v = data;
+        for (const p of path) v = v == null ? null : v[p];
+        if (typeof v === 'string' && v.trim().length > 3) filled++;
+        else if (Array.isArray(v) && v.some(x => x && String(x).trim().length > 3)) filled++;
+    }
     return Math.round(filled / Math.max(total, 1) * 100);
 }
+const BASIC_REQUIRED = [['cover','title'],['cover','group_name'],['purpose'],['materials'],['safety'],['procedure'],['data_records'],['interpretation'],['conclusion']];
+const HYPOTHESIS_REQUIRED = [['cover','title'],['cover','group_name'],['research_question'],['hypothesis'],['variables','independent'],['variables','dependent'],['variables','controlled'],['procedure'],['data_records'],['interpretation'],['judgment']];
+const FREE_REQUIRED = [['cover','title'],['cover','group_name'],['motivation'],['background'],['research_question'],['hypothesis'],['design'],['procedure'],['data_records'],['interpretation'],['conclusion']];
+const ADVANCED_REQUIRED = [['cover','title'],['cover','group_name'],['problem_context'],['research_question'],['prior_research'],['hypothesis'],['design_variables'],['design_measurement'],['procedure'],['data_records'],['interpretation'],['conclusion']];
+const ENGINEERING_REQUIRED = [['cover','title'],['cover','group_name'],['problem_def'],['constraints'],['science_principle'],['ideas'],['selected_design'],['selection_reason'],['build_test'],['improvements'],['final_conclusion']];
 
-async function buildGenericDoc(data, _chartImgs, projectName) {
-    const dx = D();
-    if (!dx) throw new Error('docx 라이브러리 로드 실패');
+// =====================================================================
+// DOCX BUILDER HELPERS — render datatable + chart for docx
+// =====================================================================
+
+// Render a datatable's chart to an offscreen canvas and return data-URL (or null if nothing to draw)
+function renderDataTableToImage(dt, w = 720, h = 360) {
+    try {
+        const canvas = document.createElement('canvas');
+        // Insert into DOM so prepareCanvas can measure parent width (it'll fall back to default if not)
+        canvas.style.width = w + 'px';
+        canvas.style.height = h + 'px';
+        document.body.appendChild(canvas);
+        const drew = renderDataTableChart(canvas, dt, { minHeight: h });
+        const url = drew ? canvas.toDataURL('image/png') : null;
+        document.body.removeChild(canvas);
+        return url;
+    } catch (e) {
+        console.error('renderDataTableToImage failed:', e);
+        return null;
+    }
+}
+
+// Build docx table from a datatable. Returns array of paragraphs+tables to append.
+function dtToDocxBlocks(dt, sectionTitle) {
+    const blocks = [];
+    if (!dt || !dt.columns) return blocks;
+    if (sectionTitle) blocks.push(mBullet(sectionTitle));
+    // Table
+    const headerRow = mR(dt.columns.map(c => mLC(c || '', Math.floor(9000 / dt.columns.length), { left: true })));
+    const dataRows = (dt.rows || []).map(row => mR(dt.columns.map((_, i) => mDC(row[i] || '', Math.floor(9000 / dt.columns.length)))));
+    blocks.push(mT([headerRow, ...dataRows]));
+    // Chart image
+    if (dt.chart && dt.chart.type !== 'none') {
+        const imgURL = renderDataTableToImage(dt, 720, 360);
+        if (imgURL) {
+            const img = mImg(imgURL, 480, 240);
+            if (img) {
+                blocks.push(mP(img, { alignment: 'center', after: 60 }));
+                if (dt.chart.title) {
+                    blocks.push(mP(mTR(dt.chart.title, { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 200 }));
+                }
+            }
+        }
+    }
+    return blocks;
+}
+
+// Photos helper for docx
+function photosToDocxBlocks(photos) {
+    const blocks = [];
+    const photoEntries = [photos?.p1, photos?.p2, photos?.p3, photos?.p4]
+        .filter(p => p && typeof p === 'string' && p.startsWith('data:image'));
+    if (photoEntries.length) {
+        photoEntries.forEach((url, i) => {
+            const img = mImg(url, 380, 260);
+            if (img) {
+                blocks.push(mP(img, { alignment: 'center', after: 60 }));
+                blocks.push(mP(mTR(`사진 ${i + 1}`, { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 200 }));
+            }
+        });
+    }
+    return blocks;
+}
+
+// Cover builder helper
+function buildCoverDocx(c, projectName, kindLabel) {
     const k = [];
-    const c = data.cover || {};
-
-    k.push(mP(mTR(projectName || '실험 보고서', { size: 18, italics: true, color: '7F7F7F' }), { alignment: 'center', after: 200 }));
+    k.push(mP(mTR(projectName || kindLabel, { size: 18, italics: true, color: '7F7F7F' }), { alignment: 'center', after: 100 }));
+    k.push(mP(mTR(kindLabel, { size: 14, color: '7F7F7F' }), { alignment: 'center', after: 200 }));
     k.push(mP(mTR(c.title || '(제목 없음)', { size: 36, bold: true, color: PRIMARY_HEX }), { alignment: 'center', after: 200 }));
     if (c.subtitle) k.push(mP(mTR(c.subtitle, { size: 22, italics: true, color: '595959' }), { alignment: 'center', after: 400 }));
     else k.push(mP(mTR(''), { after: 200 }));
-
     const coverRows = [
-        ['모둠명', c.group_name],
+        ['모둠 / 작성자', c.group_name],
         ['모둠 구성원', c.members],
         ['지도 교사', c.teacher],
-        ['실험 일자', c.date],
+        ['일자', c.date],
     ];
     k.push(mT(coverRows.map(([l, v]) => mR([mLC(l, 2200, { left: true }), mDC(v || '', 7160)]))));
     k.push(mP(mTR(''), { after: 400 }));
+    return k;
+}
 
-    k.push(mH1('1. 탐구 동기 및 문제 인식'));
-    k.push(mTxt(data.motivation || ''));
-    k.push(mBullet('탐구 질문'));
-    k.push(mTxt(data.research_question || ''));
+function buildReferencesDocx(references) {
+    const k = [];
+    const refs = (references || []).filter(r => r && r.trim());
+    if (refs.length) {
+        k.push(mH1('참고문헌'));
+        k.push(mT(refs.map((r, i) => mR([mLC(String(i + 1), 800, { left: true }), mDC(r, 8560)]))));
+    }
+    return k;
+}
 
-    k.push(mH1('2. 가설 및 변인'));
-    k.push(mBullet('가설'));
-    k.push(mTxt(data.hypothesis || ''));
-    k.push(mBullet('변인 정리'));
-    const vars = data.variables || {};
-    k.push(mT([
-        mR([mLC('독립 변인', 2200, { left: true }), mDC(vars.independent || '', 7160)]),
-        mR([mLC('종속 변인', 2200, { left: true }), mDC(vars.dependent || '', 7160)]),
-        mR([mLC('통제 변인', 2200, { left: true }), mDC(vars.controlled || '', 7160)]),
-    ]));
+// =====================================================================
+// DOCX BUILDERS for each template
+// =====================================================================
+async function buildBasicDoc(data, _chartImgs, projectName) {
+    const dx = D();
+    if (!dx) throw new Error('docx 라이브러리 로드 실패');
+    const k = [...buildCoverDocx(data.cover || {}, projectName, '기본 실험보고서')];
 
-    k.push(mH1('3. 준비물 및 실험 방법'));
+    k.push(mH1('1. 실험 목적'));
+    k.push(mTxt(data.purpose || ''));
+
+    k.push(mH1('2. 준비물 · 안전 · 실험 과정'));
     k.push(mBullet('준비물'));
     k.push(mTxt(data.materials || ''));
-    k.push(mBullet('실험 방법'));
+    k.push(mBullet('안전 유의사항'));
+    k.push(mTxt(data.safety || ''));
+    k.push(mBullet('실험 과정'));
     const proc = (data.procedure || []).filter(s => s && s.trim());
     if (proc.length) {
         k.push(mT(proc.map((s, i) => mR([mLC('Step ' + (i + 1), 1200, { left: true }), mDC(s, 8160)]))));
     }
 
-    k.push(mH1('4. 실험 결과'));
-    k.push(mBullet('관찰·측정 데이터'));
+    k.push(mH1('3. 실험 결과'));
+    k.push(mBullet('관찰·측정 기록'));
     k.push(mTxt(data.data_records || ''));
-    const photos = data.photos || {};
-    const photoEntries = [photos.p1, photos.p2, photos.p3, photos.p4]
-        .filter(p => p && typeof p === 'string' && p.startsWith('data:image'));
-    if (photoEntries.length) {
-        k.push(mBullet('실험 사진'));
-        photoEntries.forEach((url, i) => {
-            const img = mImg(url, 380, 260);
-            if (img) {
-                k.push(mP(img, { alignment: 'center', after: 60 }));
-                k.push(mP(mTR(`사진 ${i + 1}`, { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 200 }));
-            }
-        });
-    }
+    for (const b of dtToDocxBlocks(data.datatable, '데이터 표 / 그래프')) k.push(b);
+    const photoBlocks = photosToDocxBlocks(data.photos);
+    if (photoBlocks.length) { k.push(mBullet('실험 사진')); for (const b of photoBlocks) k.push(b); }
 
-    k.push(mH1('5. 분석 및 결론'));
-    k.push(mBullet('결과 분석'));
-    k.push(mTxt(data.analysis || ''));
+    k.push(mH1('4. 결과 해석 및 결론'));
+    k.push(mBullet('결과 해석'));
+    k.push(mTxt(data.interpretation || ''));
     k.push(mBullet('결론'));
     k.push(mTxt(data.conclusion || ''));
-    k.push(mBullet('느낀 점 · 한계 · 더 알아보고 싶은 것'));
-    k.push(mTxt(data.reflection || ''));
 
-    const refs = (data.references || []).filter(r => r && r.trim());
-    if (refs.length) {
-        k.push(mH1('6. 참고문헌'));
-        k.push(mT(refs.map((r, i) => mR([mLC(String(i + 1), 800, { left: true }), mDC(r, 8560)]))));
+    if ((data.extra_question && data.extra_question.trim()) || (data.roles && data.roles.trim()) || (data.reflection && data.reflection.trim())) {
+        k.push(mH1('5. 추가 사항'));
+        if (data.extra_question && data.extra_question.trim()) { k.push(mBullet('의문점 / 추가 탐구 거리')); k.push(mTxt(data.extra_question)); }
+        if (data.roles && data.roles.trim()) { k.push(mBullet('역할 분담')); k.push(mTxt(data.roles)); }
+        if (data.reflection && data.reflection.trim()) { k.push(mBullet('느낀 점')); k.push(mTxt(data.reflection)); }
     }
+
+    for (const b of buildReferencesDocx(data.references)) k.push(b);
 
     const doc = new dx.Document({
         creator: '실험 보고서 웹앱',
-        title: c.title || '실험 보고서',
+        title: data.cover?.title || '실험 보고서',
         styles: { default: { document: { run: { font: 'Malgun Gothic', size: 22 } } } },
-        sections: [{
-            properties: { page: { margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 } } },
-            children: k,
-        }],
+        sections: [{ properties: { page: { margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 } } }, children: k }],
+    });
+    return await dx.Packer.toBlob(doc);
+}
+
+async function buildHypothesisDoc(data, _chartImgs, projectName) {
+    const dx = D();
+    if (!dx) throw new Error('docx 라이브러리 로드 실패');
+    const k = [...buildCoverDocx(data.cover || {}, projectName, '가설검증 보고서')];
+
+    k.push(mH1('1. 탐구 문제 · 가설 · 변인'));
+    k.push(mBullet('탐구 문제')); k.push(mTxt(data.research_question || ''));
+    k.push(mBullet('가설')); k.push(mTxt(data.hypothesis || ''));
+    k.push(mBullet('변인 설정'));
+    const v = data.variables || {};
+    k.push(mT([
+        mR([mLC('조작 변인', 2200, { left: true }), mDC(v.independent || '', 7160)]),
+        mR([mLC('종속 변인', 2200, { left: true }), mDC(v.dependent || '', 7160)]),
+        mR([mLC('통제 변인', 2200, { left: true }), mDC(v.controlled || '', 7160)]),
+        mR([mLC('통제 방법', 2200, { left: true }), mDC(v.control_method || '', 7160)]),
+    ]));
+
+    k.push(mH1('2. 실험 목적 · 준비 · 과정'));
+    if (data.purpose && data.purpose.trim()) { k.push(mBullet('실험 목적')); k.push(mTxt(data.purpose)); }
+    k.push(mBullet('준비물')); k.push(mTxt(data.materials || ''));
+    k.push(mBullet('안전 유의사항')); k.push(mTxt(data.safety || ''));
+    k.push(mBullet('실험 과정'));
+    const proc = (data.procedure || []).filter(s => s && s.trim());
+    if (proc.length) {
+        k.push(mT(proc.map((s, i) => mR([mLC('Step ' + (i + 1), 1200, { left: true }), mDC(s, 8160)]))));
+    }
+
+    k.push(mH1('3. 실험 결과'));
+    k.push(mTxt(data.data_records || ''));
+    for (const b of dtToDocxBlocks(data.datatable, '데이터 표 / 그래프')) k.push(b);
+    const photoBlocks = photosToDocxBlocks(data.photos);
+    if (photoBlocks.length) { k.push(mBullet('실험 사진')); for (const b of photoBlocks) k.push(b); }
+
+    k.push(mH1('4. 결과 해석 · 가설 판단'));
+    k.push(mBullet('결과 해석')); k.push(mTxt(data.interpretation || ''));
+    k.push(mBullet('가설 채택 / 기각 판단')); k.push(mTxt(data.judgment || ''));
+
+    if ((data.claim && data.claim.trim()) || (data.evidence && data.evidence.trim()) || (data.reasoning && data.reasoning.trim())) {
+        k.push(mH1('5. 결론 (논증 형식)'));
+        if (data.claim) { k.push(mBullet('주장')); k.push(mTxt(data.claim)); }
+        if (data.evidence) { k.push(mBullet('근거')); k.push(mTxt(data.evidence)); }
+        if (data.reasoning) { k.push(mBullet('추론')); k.push(mTxt(data.reasoning)); }
+        if (data.alt_interpretation && data.alt_interpretation.trim()) { k.push(mBullet('대안 해석 검토')); k.push(mTxt(data.alt_interpretation)); }
+    }
+
+    for (const b of buildReferencesDocx(data.references)) k.push(b);
+
+    const doc = new dx.Document({
+        creator: '실험 보고서 웹앱', title: data.cover?.title || '가설검증 보고서',
+        styles: { default: { document: { run: { font: 'Malgun Gothic', size: 22 } } } },
+        sections: [{ properties: { page: { margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 } } }, children: k }],
+    });
+    return await dx.Packer.toBlob(doc);
+}
+
+async function buildFreeDoc(data, _chartImgs, projectName) {
+    const dx = D();
+    if (!dx) throw new Error('docx 라이브러리 로드 실패');
+    const k = [...buildCoverDocx(data.cover || {}, projectName, '자유탐구 보고서')];
+
+    k.push(mH1('1. 주제 선정 · 배경'));
+    k.push(mBullet('탐구 주제 선정 동기')); k.push(mTxt(data.motivation || ''));
+    k.push(mBullet('사전 조사')); k.push(mTxt(data.background || ''));
+
+    k.push(mH1('2. 탐구 문제 · 가설 · 설계'));
+    k.push(mBullet('탐구 문제')); k.push(mTxt(data.research_question || ''));
+    k.push(mBullet('가설')); k.push(mTxt(data.hypothesis || ''));
+    k.push(mBullet('탐구 설계')); k.push(mTxt(data.design || ''));
+    if (data.expected && data.expected.trim()) { k.push(mBullet('예상 결과')); k.push(mTxt(data.expected)); }
+
+    k.push(mH1('3. 준비물 · 탐구 과정'));
+    k.push(mBullet('준비물')); k.push(mTxt(data.materials || ''));
+    k.push(mBullet('탐구 과정'));
+    const proc = (data.procedure || []).filter(s => s && s.trim());
+    if (proc.length) {
+        k.push(mT(proc.map((s, i) => mR([mLC('Step ' + (i + 1), 1200, { left: true }), mDC(s, 8160)]))));
+    }
+
+    k.push(mH1('4. 결과'));
+    k.push(mTxt(data.data_records || ''));
+    for (const b of dtToDocxBlocks(data.datatable, '데이터 표 / 그래프')) k.push(b);
+    const photoBlocks = photosToDocxBlocks(data.photos);
+    if (photoBlocks.length) { k.push(mBullet('실험 사진')); for (const b of photoBlocks) k.push(b); }
+    if (data.iteration && data.iteration.trim()) { k.push(mBullet('시행착오 / 설계 변경 기록')); k.push(mTxt(data.iteration)); }
+
+    k.push(mH1('5. 결과 해석 및 결론'));
+    k.push(mBullet('결과 해석')); k.push(mTxt(data.interpretation || ''));
+    k.push(mBullet('결론')); k.push(mTxt(data.conclusion || ''));
+    if ((data.claim && data.claim.trim()) || (data.evidence && data.evidence.trim()) || (data.reasoning && data.reasoning.trim())) {
+        k.push(mBullet('논증형 결론'));
+        if (data.claim) { k.push(mTxt('주장: ' + data.claim)); }
+        if (data.evidence) { k.push(mTxt('근거: ' + data.evidence)); }
+        if (data.reasoning) { k.push(mTxt('추론: ' + data.reasoning)); }
+    }
+    if (data.next_step && data.next_step.trim()) { k.push(mBullet('후속 탐구 아이디어')); k.push(mTxt(data.next_step)); }
+
+    for (const b of buildReferencesDocx(data.references)) k.push(b);
+
+    const doc = new dx.Document({
+        creator: '실험 보고서 웹앱', title: data.cover?.title || '자유탐구 보고서',
+        styles: { default: { document: { run: { font: 'Malgun Gothic', size: 22 } } } },
+        sections: [{ properties: { page: { margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 } } }, children: k }],
+    });
+    return await dx.Packer.toBlob(doc);
+}
+
+async function buildAdvancedDoc(data, _chartImgs, projectName) {
+    const dx = D();
+    if (!dx) throw new Error('docx 라이브러리 로드 실패');
+    const k = [...buildCoverDocx(data.cover || {}, projectName, '심화탐구 보고서')];
+
+    k.push(mH1('1. 문제 상황 · 탐구 문제 · 선행연구'));
+    k.push(mBullet('문제 상황')); k.push(mTxt(data.problem_context || ''));
+    k.push(mBullet('탐구 문제')); k.push(mTxt(data.research_question || ''));
+    k.push(mBullet('선행연구 분석')); k.push(mTxt(data.prior_research || ''));
+    if (data.theory_background && data.theory_background.trim()) { k.push(mBullet('이론적 배경')); k.push(mTxt(data.theory_background)); }
+
+    k.push(mH1('2. 가설 / 연구 질문 · 탐구 설계'));
+    k.push(mBullet('가설 또는 연구 질문')); k.push(mTxt(data.hypothesis || ''));
+    k.push(mBullet('변인 설정')); k.push(mTxt(data.design_variables || ''));
+    k.push(mBullet('측정 방법')); k.push(mTxt(data.design_measurement || ''));
+    k.push(mBullet('분석 방법')); k.push(mTxt(data.design_analysis || ''));
+
+    k.push(mH1('3. 탐구 과정'));
+    const proc = (data.procedure || []).filter(s => s && s.trim());
+    if (proc.length) {
+        k.push(mT(proc.map((s, i) => mR([mLC('Step ' + (i + 1), 1200, { left: true }), mDC(s, 8160)]))));
+    }
+
+    k.push(mH1('4. 탐구 결과'));
+    k.push(mTxt(data.data_records || ''));
+    for (const b of dtToDocxBlocks(data.datatable, '데이터 표 / 그래프')) k.push(b);
+    const photoBlocks = photosToDocxBlocks(data.photos);
+    if (photoBlocks.length) { k.push(mBullet('실험 사진')); for (const b of photoBlocks) k.push(b); }
+    if (data.statistics && data.statistics.trim()) { k.push(mBullet('통계적 처리')); k.push(mTxt(data.statistics)); }
+
+    k.push(mH1('5. 결과 해석 · 결론 · 의의'));
+    k.push(mBullet('결과 해석')); k.push(mTxt(data.interpretation || ''));
+    k.push(mBullet('결론')); k.push(mTxt(data.conclusion || ''));
+    if (data.significance && data.significance.trim()) { k.push(mBullet('탐구의 의의')); k.push(mTxt(data.significance)); }
+    if (data.limitations && data.limitations.trim()) { k.push(mBullet('한계')); k.push(mTxt(data.limitations)); }
+    if (data.next_step && data.next_step.trim()) { k.push(mBullet('후속 탐구 제안')); k.push(mTxt(data.next_step)); }
+
+    for (const b of buildReferencesDocx(data.references)) k.push(b);
+
+    const doc = new dx.Document({
+        creator: '실험 보고서 웹앱', title: data.cover?.title || '심화탐구 보고서',
+        styles: { default: { document: { run: { font: 'Malgun Gothic', size: 22 } } } },
+        sections: [{ properties: { page: { margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 } } }, children: k }],
+    });
+    return await dx.Packer.toBlob(doc);
+}
+
+async function buildEngineeringDoc(data, _chartImgs, projectName) {
+    const dx = D();
+    if (!dx) throw new Error('docx 라이브러리 로드 실패');
+    const k = [...buildCoverDocx(data.cover || {}, projectName, '공학설계 보고서')];
+
+    k.push(mH1('1. 문제 정의 · 관련 원리'));
+    k.push(mBullet('문제 정의')); k.push(mTxt(data.problem_def || ''));
+    k.push(mBullet('제약 조건')); k.push(mTxt(data.constraints || ''));
+    k.push(mBullet('관련 과학 개념·원리')); k.push(mTxt(data.science_principle || ''));
+
+    k.push(mH1('2. 아이디어 도출 · 대안 비교 · 선정'));
+    const ideas = (data.ideas || []).filter(s => s && s.trim());
+    if (ideas.length) {
+        k.push(mBullet('아이디어'));
+        k.push(mT(ideas.map((s, i) => mR([mLC('아이디어 ' + (i + 1), 1500, { left: true }), mDC(s, 7860)]))));
+    }
+    k.push(mBullet('대안 비교')); k.push(mTxt(data.alternatives_compare || ''));
+    k.push(mBullet('선정된 설계안')); k.push(mTxt(data.selected_design || ''));
+    k.push(mBullet('선정 기준과 근거')); k.push(mTxt(data.selection_reason || ''));
+
+    k.push(mH1('3. 설계도 · 모델'));
+    k.push(mBullet('설계 설명')); k.push(mTxt(data.design_drawing || ''));
+    if (data.drawing_image && typeof data.drawing_image === 'string' && data.drawing_image.startsWith('data:image')) {
+        const img = mImg(data.drawing_image, 460, 320);
+        if (img) {
+            k.push(mP(img, { alignment: 'center', after: 100 }));
+            k.push(mP(mTR('설계도', { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 200 }));
+        }
+    }
+
+    k.push(mH1('4. 제작 · 시험 · 데이터'));
+    k.push(mBullet('제작 및 시험 결과')); k.push(mTxt(data.build_test || ''));
+    for (const b of dtToDocxBlocks(data.datatable, '시험 데이터 표 / 그래프')) k.push(b);
+    if (data.data_records && data.data_records.trim()) { k.push(mBullet('관찰 기록')); k.push(mTxt(data.data_records)); }
+    const photoBlocks = photosToDocxBlocks(data.photos);
+    if (photoBlocks.length) { k.push(mBullet('제작 사진')); for (const b of photoBlocks) k.push(b); }
+
+    k.push(mH1('5. 개선 · 최종 결론 · 평가'));
+    k.push(mBullet('개선 사항')); k.push(mTxt(data.improvements || ''));
+    k.push(mBullet('최종 결론')); k.push(mTxt(data.final_conclusion || ''));
+    if (data.cost_time && data.cost_time.trim()) { k.push(mBullet('비용·시간 분석')); k.push(mTxt(data.cost_time)); }
+    if (data.applicability && data.applicability.trim()) { k.push(mBullet('적용 가능성')); k.push(mTxt(data.applicability)); }
+    if (data.safety_review && data.safety_review.trim()) { k.push(mBullet('안전성 검토')); k.push(mTxt(data.safety_review)); }
+
+    for (const b of buildReferencesDocx(data.references)) k.push(b);
+
+    const doc = new dx.Document({
+        creator: '실험 보고서 웹앱', title: data.cover?.title || '공학설계 보고서',
+        styles: { default: { document: { run: { font: 'Malgun Gothic', size: 22 } } } },
+        sections: [{ properties: { page: { margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 } } }, children: k }],
     });
     return await dx.Packer.toBlob(doc);
 }
 
 // =====================================================================
-// TEMPLATES REGISTRY — 맞춤형 새 템플릿을 추가하려면 여기에 한 항목 추가
+// TEMPLATES REGISTRY
+// 새 맞춤 템플릿(친환경 제설제 같은)을 추가하려면 여기에 한 항목 더 추가.
 // =====================================================================
 const TEMPLATES = {
     snow_melter: {
@@ -3553,15 +5247,64 @@ const TEMPLATES = {
         buildDoc: (data, chartImgs /*, name*/) => buildSnowMelterDoc(data, chartImgs),
         hasCharts: true,
     },
-    generic: {
-        label: '일반 실험 보고서',
-        category: '일반 실험',
+    basic: {
+        label: '기본 실험보고서',
+        category: '과학 실험보고서',
+        description: '일반 실험수업 전반. 중·고 보편.',
         builtin: false,
         dataRootFor: (instanceId) => `projects/${instanceId}`,
-        sections: GENERIC_SECTIONS,
-        EMPTY_DATA: GENERIC_EMPTY_DATA,
-        computeProgress: computeGenericProgress,
-        buildDoc: buildGenericDoc,
+        sections: BASIC_SECTIONS,
+        EMPTY_DATA: BASIC_EMPTY_DATA,
+        computeProgress: (d) => computeReportProgress(d, BASIC_REQUIRED),
+        buildDoc: buildBasicDoc,
+        hasCharts: false,
+    },
+    hypothesis: {
+        label: '가설검증 보고서',
+        category: '과학 실험보고서',
+        description: '변인 통제·가설 검증이 들어가는 실험. 고1 이상 권장.',
+        builtin: false,
+        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        sections: HYPOTHESIS_SECTIONS,
+        EMPTY_DATA: HYPOTHESIS_EMPTY_DATA,
+        computeProgress: (d) => computeReportProgress(d, HYPOTHESIS_REQUIRED),
+        buildDoc: buildHypothesisDoc,
+        hasCharts: false,
+    },
+    free: {
+        label: '자유탐구 보고서',
+        category: '과학 실험보고서',
+        description: '동아리·방과후·자유탐구 단원. 학생이 직접 설계.',
+        builtin: false,
+        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        sections: FREE_SECTIONS,
+        EMPTY_DATA: FREE_EMPTY_DATA,
+        computeProgress: (d) => computeReportProgress(d, FREE_REQUIRED),
+        buildDoc: buildFreeDoc,
+        hasCharts: false,
+    },
+    advanced: {
+        label: '심화탐구 보고서',
+        category: '과학 실험보고서',
+        description: '과제연구·R&E·영재반. 선행연구 분석 포함.',
+        builtin: false,
+        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        sections: ADVANCED_SECTIONS,
+        EMPTY_DATA: ADVANCED_EMPTY_DATA,
+        computeProgress: (d) => computeReportProgress(d, ADVANCED_REQUIRED),
+        buildDoc: buildAdvancedDoc,
+        hasCharts: false,
+    },
+    engineering: {
+        label: '공학설계 보고서',
+        category: '과학 실험보고서',
+        description: 'STEAM·공학적 문제해결. 설계·제작·개선 반복.',
+        builtin: false,
+        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        sections: ENGINEERING_SECTIONS,
+        EMPTY_DATA: ENGINEERING_EMPTY_DATA,
+        computeProgress: (d) => computeReportProgress(d, ENGINEERING_REQUIRED),
+        buildDoc: buildEngineeringDoc,
         hasCharts: false,
     },
 };
@@ -3872,7 +5615,7 @@ function ProjectListScreen({ user, isAdminUser, onPickProject, onAdminLogin, onS
                 dataRoot: t.dataRootFor(id),
             }));
         const userOnes = (userProjects || []).map(p => {
-            const tpl = TEMPLATES[p.templateId] || TEMPLATES.generic;
+            const tpl = TEMPLATES[p.templateId] || TEMPLATES.basic;
             return {
                 id: p.id, name: p.name, category: p.category,
                 templateId: p.templateId, builtin: false,
@@ -3962,13 +5705,26 @@ function ProjectListScreen({ user, isAdminUser, onPickProject, onAdminLogin, onS
 
 function CreateProjectModal({ onClose, onCreate }) {
     const [name, setName] = useState('');
-    const [templateId, setTemplateId] = useState('generic');
-    const [category, setCategory] = useState('일반 실험');
     const choices = Object.entries(TEMPLATES).filter(([id, t]) => !t.builtin);
+    const defaultId = choices.length ? choices[0][0] : 'basic';
+    const [templateId, setTemplateId] = useState(defaultId);
+    const defaultCat = TEMPLATES[defaultId]?.category || '과학 실험보고서';
+    const [category, setCategory] = useState(defaultCat);
 
+    // When template changes, update category default (only if the user hasn't customized it)
+    const lastAutoCat = useRef(defaultCat);
+    useEffect(() => {
+        const tplCat = TEMPLATES[templateId]?.category || '';
+        if (category === lastAutoCat.current) {
+            setCategory(tplCat);
+            lastAutoCat.current = tplCat;
+        }
+    }, [templateId]);
+
+    const tpl = TEMPLATES[templateId] || {};
     const submit = () => {
         if (!name.trim()) return;
-        onCreate({ name: name.trim(), templateId, category: category.trim() || '일반 실험' });
+        onCreate({ name: name.trim(), templateId, category: category.trim() || (TEMPLATES[templateId]?.category || '과학 실험보고서') });
     };
 
     return React.createElement(Modal, { title: '새 프로젝트 만들기', onClose, onConfirm: submit, confirmDisabled: !name.trim() },
@@ -3976,17 +5732,19 @@ function CreateProjectModal({ onClose, onCreate }) {
             React.createElement('label', null, '프로젝트 이름'),
             React.createElement('input', { type: 'text', value: name, onChange: e => setName(e.target.value), placeholder: '예: 물의 표면장력 실험', autoFocus: true })),
         React.createElement('div', { className: 'form-group' },
-            React.createElement('label', null, '템플릿'),
+            React.createElement('label', null, '보고서 유형'),
             React.createElement('select', {
                 value: templateId, onChange: e => setTemplateId(e.target.value),
                 style: { width: '100%', padding: '10px 12px', border: '1px solid #d1d5db', borderRadius: 6, fontSize: 14, background: 'white' }
             },
-                choices.map(([id, t]) => React.createElement('option', { key: id, value: id }, t.label)))),
+                choices.map(([id, t]) => React.createElement('option', { key: id, value: id }, t.label))),
+            tpl.description && React.createElement('div', { style: { fontSize: 12, color: '#6b7280', marginTop: 6, paddingLeft: 2, lineHeight: 1.5 } },
+                tpl.description)),
         React.createElement('div', { className: 'form-group' },
-            React.createElement('label', null, '카테고리'),
-            React.createElement('input', { type: 'text', value: category, onChange: e => setCategory(e.target.value), placeholder: '일반 실험, 영재수업 등' })),
+            React.createElement('label', null, '카테고리 (목록 그룹)'),
+            React.createElement('input', { type: 'text', value: category, onChange: e => { setCategory(e.target.value); lastAutoCat.current = '___user___'; }, placeholder: '과학 실험보고서, 영재수업 등' })),
         React.createElement('p', { style: { fontSize: 12, color: '#6b7280', marginTop: 10, lineHeight: 1.5 } },
-            '※ "친환경 제설제"처럼 맞춤형 양식의 새 템플릿을 추가하려면 코드 수정이 필요합니다. 일반 실험 보고서는 누구나 만들 수 있습니다.')
+            '※ "친환경 제설제"처럼 모둠별 맞춤형 양식의 새 템플릿을 추가하려면 코드 수정이 필요합니다.')
     );
 }
 
