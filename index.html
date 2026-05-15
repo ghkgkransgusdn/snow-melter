@@ -4903,19 +4903,26 @@ function renderDataTableToImage(dt, w = 720, h = 360) {
 // Build docx table from a datatable. Returns array of paragraphs+tables to append.
 function dtToDocxBlocks(dt, sectionTitle) {
     const blocks = [];
-    if (!dt || !dt.columns) return blocks;
+    if (!dt || !dt.columns || dt.columns.length === 0) return blocks;
     if (sectionTitle) blocks.push(mBullet(sectionTitle));
-    // Table
-    const headerRow = mR(dt.columns.map(c => mLC(c || '', Math.floor(9000 / dt.columns.length), { left: true })));
-    const dataRows = (dt.rows || []).map(row => mR(dt.columns.map((_, i) => mDC(row[i] || '', Math.floor(9000 / dt.columns.length)))));
-    blocks.push(mT([headerRow, ...dataRows]));
+    // Only emit table if there's at least some content (any cell non-empty),
+    // otherwise an all-empty table is just visual noise.
+    const hasAnyContent = (dt.rows || []).some(row => (row || []).some(v => v && String(v).trim()));
+    const colW = Math.floor(9000 / dt.columns.length);
+    if (hasAnyContent || (dt.columns || []).some(c => c && c.trim() && c !== 'x' && c !== 'y')) {
+        const headerRow = mR(dt.columns.map(c => mLC(c || '', colW, { left: true })));
+        const dataRows = (dt.rows || []).map(row =>
+            mR(dt.columns.map((_, i) => mDC((row && row[i]) || '', colW)))
+        );
+        blocks.push(mT([headerRow, ...dataRows]));
+    }
     // Chart image
-    if (dt.chart && dt.chart.type !== 'none') {
+    if (dt.chart && dt.chart.type !== 'none' && hasAnyContent) {
         const imgURL = renderDataTableToImage(dt, 720, 360);
         if (imgURL) {
             const img = mImg(imgURL, 480, 240);
             if (img) {
-                blocks.push(mP(img, { alignment: 'center', after: 60 }));
+                blocks.push(img); // mImg already returns a centered Paragraph
                 if (dt.chart.title) {
                     blocks.push(mP(mTR(dt.chart.title, { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 200 }));
                 }
@@ -4934,7 +4941,7 @@ function photosToDocxBlocks(photos) {
         photoEntries.forEach((url, i) => {
             const img = mImg(url, 380, 260);
             if (img) {
-                blocks.push(mP(img, { alignment: 'center', after: 60 }));
+                blocks.push(img); // already a centered Paragraph
                 blocks.push(mP(mTR(`사진 ${i + 1}`, { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 200 }));
             }
         });
@@ -5202,7 +5209,7 @@ async function buildEngineeringDoc(data, _chartImgs, projectName) {
     if (data.drawing_image && typeof data.drawing_image === 'string' && data.drawing_image.startsWith('data:image')) {
         const img = mImg(data.drawing_image, 460, 320);
         if (img) {
-            k.push(mP(img, { alignment: 'center', after: 100 }));
+            k.push(img); // already a centered Paragraph
             k.push(mP(mTR('설계도', { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 200 }));
         }
     }
