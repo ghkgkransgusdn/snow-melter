@@ -3641,7 +3641,7 @@ const SERIES_COLORS = ['#dc2626', '#2563eb', '#16a34a', '#a855f7', '#ea580c', '#
 // Render a datatable's chart to a canvas. Returns true if anything was drawn.
 function renderDataTableChart(canvas, dt, opts = {}) {
     const _hasTrend = dt && dt.chart && dt.chart.trendline && dt.chart.trendline !== 'none' && dt.chart.showEquation !== false;
-    const defaultH = _hasTrend ? 440 : 360;
+    const defaultH = _hasTrend ? 500 : 420;
     const { ctx, width, height } = prepareCanvas(canvas, opts.minHeight || defaultH);
     const chart = dt.chart || {};
     const type = chart.type || 'none';
@@ -3684,8 +3684,8 @@ function renderDataTableChart(canvas, dt, opts = {}) {
     // ===== Chart layout =====
     // Reserve extra space at bottom if trendlines are enabled (for equation panel)
     const hasTrend = chart.trendline && chart.trendline !== 'none' && chart.showEquation !== false;
-    const padTop = 56, padLeft = 64, padRight = 30;
-    const padBottom = 56 + (hasTrend ? 90 : 0);
+    const padTop = 68, padLeft = 84, padRight = 30;
+    const padBottom = 70 + (hasTrend ? 100 : 0);
     const plotW = width - padLeft - padRight;
     const plotH = height - padTop - padBottom;
     const plotX0 = padLeft, plotY0 = padTop;
@@ -3697,17 +3697,33 @@ function renderDataTableChart(canvas, dt, opts = {}) {
     // Title
     if (chart.title) {
         ctx.fillStyle = '#111827';
-        ctx.font = 'bold 17px Malgun Gothic, sans-serif';
+        ctx.font = 'bold 22px Malgun Gothic, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText(chart.title, width / 2, 28);
+        ctx.fillText(chart.title, width / 2, 32);
     }
 
-    // Axis labels (column names) — positioned right below tick labels (not at bottom of canvas)
+    // X-axis label (column name) — positioned right below tick labels
     const xLabel = dt.columns[xCol] || 'x';
-    ctx.fillStyle = '#374151';
-    ctx.font = 'bold 14px Malgun Gothic, sans-serif';
+    ctx.fillStyle = '#111827';
+    ctx.font = 'bold 18px Malgun Gothic, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(xLabel, plotX0 + plotW / 2, plotY0 + plotH + 40);
+    ctx.fillText(xLabel, plotX0 + plotW / 2, plotY0 + plotH + 50);
+
+    // Y-axis label — rotated 90° counterclockwise on the left side
+    // If exactly 1 y-series, use its name; if multiple, leave to legend
+    let yAxisLabel = '';
+    if (yCols.length === 1) yAxisLabel = dt.columns[yCols[0]] || '';
+    else if (yCols.length > 1) yAxisLabel = '값';
+    if (yAxisLabel) {
+        ctx.save();
+        ctx.translate(24, plotY0 + plotH / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillStyle = '#111827';
+        ctx.font = 'bold 18px Malgun Gothic, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(yAxisLabel, 0, 0);
+        ctx.restore();
+    }
 
     // ===== Compute axis ranges =====
     let yMin = Infinity, yMax = -Infinity;
@@ -3752,7 +3768,7 @@ function renderDataTableChart(canvas, dt, opts = {}) {
     // ===== Draw grid & axes =====
     const showGrid = chart.showGrid !== false;
     ctx.fillStyle = '#6b7280';
-    ctx.font = '13px Malgun Gothic, sans-serif';
+    ctx.font = '14px Malgun Gothic, sans-serif';
     // Y grid
     const yTicks = 5;
     if (showGrid) {
@@ -3771,7 +3787,7 @@ function renderDataTableChart(canvas, dt, opts = {}) {
         } else {
             val = yRange.min + (i / yTicks) * (yRange.max - yRange.min);
         }
-        ctx.fillText(fmtAxisVal(val, yLog), plotX0 - 6, y + 4);
+        ctx.fillText(fmtAxisVal(val, yLog), plotX0 - 8, y + 5);
     }
     // X grid
     if (type === 'bar') {
@@ -3783,7 +3799,7 @@ function renderDataTableChart(canvas, dt, opts = {}) {
             const x = plotX0 + (i / xTicks) * plotW;
             if (showGrid) { ctx.moveTo(x, plotY0); ctx.lineTo(x, plotY0 + plotH); }
             const val = xMin + (i / xTicks) * (xMax - xMin);
-            ctx.fillText(fmtAxisVal(val, false), x, plotY0 + plotH + 18);
+            ctx.fillText(fmtAxisVal(val, false), x, plotY0 + plotH + 22);
         }
     }
     if (showGrid) ctx.stroke();
@@ -3956,46 +3972,46 @@ function renderDataTableChart(canvas, dt, opts = {}) {
             });
             // Category label
             ctx.fillStyle = '#374151';
-            ctx.font = '13px Malgun Gothic, sans-serif';
+            ctx.font = '14px Malgun Gothic, sans-serif';
             ctx.textAlign = 'center';
             const cx = plotX0 + groupW * gi + groupW / 2;
-            ctx.fillText(String(cat), cx, plotY0 + plotH + 18);
+            ctx.fillText(String(cat), cx, plotY0 + plotH + 22);
         });
     }
 
     // ===== Legend =====
-    const legendY = padTop / 2 + 8;
+    const legendY = 56;
     let legendX = plotX0;
-    ctx.font = '13px Malgun Gothic, sans-serif';
+    ctx.font = '14px Malgun Gothic, sans-serif';
     ctx.textAlign = 'left';
     yCols.forEach((col, sIdx) => {
         const color = SERIES_COLORS[sIdx % SERIES_COLORS.length];
         const label = dt.columns[col] || ('y' + (sIdx + 1));
         const textW = ctx.measureText(label).width;
         ctx.fillStyle = color;
-        ctx.fillRect(legendX, legendY - 10, 14, 14);
+        ctx.fillRect(legendX, legendY - 12, 16, 16);
         ctx.fillStyle = '#111827';
-        ctx.fillText(label, legendX + 20, legendY + 2);
-        legendX += textW + 38;
+        ctx.fillText(label, legendX + 22, legendY + 2);
+        legendX += textW + 42;
     });
 
     // Fit equations panel — below the x-axis label
     if (trendLabels.length) {
-        let ty = plotY0 + plotH + (type === 'bar' ? 72 : 68);
+        let ty = plotY0 + plotH + (type === 'bar' ? 84 : 80);
         const maxFit = 4;
-        ctx.font = 'bold 13px Malgun Gothic, sans-serif';
+        ctx.font = 'bold 14px Malgun Gothic, sans-serif';
         ctx.textAlign = 'left';
         trendLabels.slice(0, maxFit).forEach((l) => {
             // Small color swatch
             ctx.fillStyle = l.color;
-            ctx.fillRect(plotX0, ty - 10, 12, 12);
+            ctx.fillRect(plotX0, ty - 11, 14, 14);
             ctx.fillStyle = '#111827';
-            ctx.fillText(l.text, plotX0 + 18, ty);
-            ty += 18;
+            ctx.fillText(l.text, plotX0 + 20, ty);
+            ty += 20;
         });
         if (trendLabels.length > maxFit) {
             ctx.fillStyle = '#6b7280';
-            ctx.fillText(`(외 ${trendLabels.length - maxFit}개 추세선 생략)`, plotX0 + 18, ty);
+            ctx.fillText(`(외 ${trendLabels.length - maxFit}개 추세선 생략)`, plotX0 + 20, ty);
         }
     }
 
@@ -4883,7 +4899,7 @@ const ENGINEERING_REQUIRED = [['cover','title'],['cover','group_name'],['problem
 // =====================================================================
 
 // Render a datatable's chart to an offscreen canvas and return data-URL (or null if nothing to draw)
-function renderDataTableToImage(dt, w = 720, h = 400) {
+function renderDataTableToImage(dt, w = 720, h = 460) {
     try {
         const canvas = document.createElement('canvas');
         // Insert into DOM so prepareCanvas can measure parent width (it'll fall back to default if not)
@@ -4918,9 +4934,9 @@ function dtToDocxBlocks(dt, sectionTitle) {
     }
     // Chart image
     if (dt.chart && dt.chart.type !== 'none' && hasAnyContent) {
-        const imgURL = renderDataTableToImage(dt, 720, 400);
+        const imgURL = renderDataTableToImage(dt, 720, 460);
         if (imgURL) {
-            const img = mImg(imgURL, 480, 267);
+            const img = mImg(imgURL, 480, 307);
             if (img) {
                 blocks.push(img); // mImg already returns a centered Paragraph
                 if (dt.chart.title) {
@@ -5687,14 +5703,7 @@ function ProjectListScreen({ user, isAdminUser, onPickProject, onAdminLogin, onS
                     projects.map(p => React.createElement('div', { key: p.id, className: 'list-card', onClick: () => onPickProject(p) },
                         React.createElement('span', { className: 'icon' }, p.builtin ? '🌟' : '📝'),
                         React.createElement('div', { className: 'body' },
-                            React.createElement('div', { className: 'title' }, p.name,
-                                p.builtin && React.createElement('span', {
-                                    style: {
-                                        fontSize: 10, background: '#fef3c7', color: '#92400e',
-                                        padding: '2px 6px', borderRadius: 4, marginLeft: 8,
-                                        fontWeight: 600
-                                    }
-                                }, '기본 제공')),
+                            React.createElement('div', { className: 'title' }, p.name),
                             React.createElement('div', { className: 'meta' }, '템플릿: ', (TEMPLATES[p.templateId] || {}).label || p.templateId)),
                         isAdminUser && !p.builtin && React.createElement('div', { className: 'actions', onClick: (e) => e.stopPropagation() },
                             React.createElement('button', { className: 'btn btn-secondary', onClick: () => handleRename(p) }, '이름변경'),
