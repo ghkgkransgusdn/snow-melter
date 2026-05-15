@@ -3709,20 +3709,23 @@ function renderDataTableChart(canvas, dt, opts = {}) {
     ctx.textAlign = 'center';
     ctx.fillText(xLabel, plotX0 + plotW / 2, plotY0 + plotH + 50);
 
-    // Y-axis label — rotated 90° counterclockwise on the left side
-    // If exactly 1 y-series, use its name; if multiple, leave to legend
+    // Y-axis label — stack characters vertically (one per line) so Korean reads naturally top→bottom.
+    // If exactly 1 y-series, use its name; if multiple, leave to legend.
     let yAxisLabel = '';
     if (yCols.length === 1) yAxisLabel = dt.columns[yCols[0]] || '';
     else if (yCols.length > 1) yAxisLabel = '값';
     if (yAxisLabel) {
-        ctx.save();
-        ctx.translate(24, plotY0 + plotH / 2);
-        ctx.rotate(-Math.PI / 2);
         ctx.fillStyle = '#111827';
         ctx.font = 'bold 18px Malgun Gothic, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText(yAxisLabel, 0, 0);
-        ctx.restore();
+        const chars = Array.from(yAxisLabel); // split into characters (handles surrogate pairs too)
+        const lineH = 22;
+        // Center the column of characters vertically within plot area
+        const totalH = chars.length * lineH;
+        const startY = plotY0 + plotH / 2 - totalH / 2 + lineH * 0.8;
+        chars.forEach((ch, i) => {
+            ctx.fillText(ch, 24, startY + i * lineH);
+        });
     }
 
     // ===== Compute axis ranges =====
