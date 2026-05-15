@@ -3641,7 +3641,7 @@ const SERIES_COLORS = ['#dc2626', '#2563eb', '#16a34a', '#a855f7', '#ea580c', '#
 // Render a datatable's chart to a canvas. Returns true if anything was drawn.
 function renderDataTableChart(canvas, dt, opts = {}) {
     const _hasTrend = dt && dt.chart && dt.chart.trendline && dt.chart.trendline !== 'none' && dt.chart.showEquation !== false;
-    const defaultH = _hasTrend ? 400 : 320;
+    const defaultH = _hasTrend ? 440 : 360;
     const { ctx, width, height } = prepareCanvas(canvas, opts.minHeight || defaultH);
     const chart = dt.chart || {};
     const type = chart.type || 'none';
@@ -3684,8 +3684,8 @@ function renderDataTableChart(canvas, dt, opts = {}) {
     // ===== Chart layout =====
     // Reserve extra space at bottom if trendlines are enabled (for equation panel)
     const hasTrend = chart.trendline && chart.trendline !== 'none' && chart.showEquation !== false;
-    const padTop = 50, padLeft = 60, padRight = 30;
-    const padBottom = 60 + (hasTrend ? 70 : 0);
+    const padTop = 56, padLeft = 64, padRight = 30;
+    const padBottom = 56 + (hasTrend ? 90 : 0);
     const plotW = width - padLeft - padRight;
     const plotH = height - padTop - padBottom;
     const plotX0 = padLeft, plotY0 = padTop;
@@ -3697,17 +3697,17 @@ function renderDataTableChart(canvas, dt, opts = {}) {
     // Title
     if (chart.title) {
         ctx.fillStyle = '#111827';
-        ctx.font = 'bold 15px Malgun Gothic, sans-serif';
+        ctx.font = 'bold 17px Malgun Gothic, sans-serif';
         ctx.textAlign = 'center';
-        ctx.fillText(chart.title, width / 2, 26);
+        ctx.fillText(chart.title, width / 2, 28);
     }
 
-    // Axis labels (column names)
+    // Axis labels (column names) — positioned right below tick labels (not at bottom of canvas)
     const xLabel = dt.columns[xCol] || 'x';
     ctx.fillStyle = '#374151';
-    ctx.font = '12px Malgun Gothic, sans-serif';
+    ctx.font = 'bold 14px Malgun Gothic, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText(xLabel, plotX0 + plotW / 2, height - 18);
+    ctx.fillText(xLabel, plotX0 + plotW / 2, plotY0 + plotH + 40);
 
     // ===== Compute axis ranges =====
     let yMin = Infinity, yMax = -Infinity;
@@ -3752,7 +3752,7 @@ function renderDataTableChart(canvas, dt, opts = {}) {
     // ===== Draw grid & axes =====
     const showGrid = chart.showGrid !== false;
     ctx.fillStyle = '#6b7280';
-    ctx.font = '11px Malgun Gothic, sans-serif';
+    ctx.font = '13px Malgun Gothic, sans-serif';
     // Y grid
     const yTicks = 5;
     if (showGrid) {
@@ -3783,7 +3783,7 @@ function renderDataTableChart(canvas, dt, opts = {}) {
             const x = plotX0 + (i / xTicks) * plotW;
             if (showGrid) { ctx.moveTo(x, plotY0); ctx.lineTo(x, plotY0 + plotH); }
             const val = xMin + (i / xTicks) * (xMax - xMin);
-            ctx.fillText(fmtAxisVal(val, false), x, plotY0 + plotH + 16);
+            ctx.fillText(fmtAxisVal(val, false), x, plotY0 + plotH + 18);
         }
     }
     if (showGrid) ctx.stroke();
@@ -3865,12 +3865,12 @@ function renderDataTableChart(canvas, dt, opts = {}) {
         // Point labels (small text next to each point)
         if (showLabels) {
             ctx.fillStyle = '#111827';
-            ctx.font = '10px Malgun Gothic, sans-serif';
+            ctx.font = '12px Malgun Gothic, sans-serif';
             ctx.textAlign = 'left';
             valid.forEach(p => {
                 const px = toX(p.x);
                 const py = toY(p.y);
-                ctx.fillText(`(${fmtNum(p.x)}, ${fmtNum(p.y)})`, px + 6, py - 6);
+                ctx.fillText(`(${fmtNum(p.x)}, ${fmtNum(p.y)})`, px + 7, py - 7);
             });
         }
     };
@@ -3956,46 +3956,46 @@ function renderDataTableChart(canvas, dt, opts = {}) {
             });
             // Category label
             ctx.fillStyle = '#374151';
-            ctx.font = '11px Malgun Gothic, sans-serif';
+            ctx.font = '13px Malgun Gothic, sans-serif';
             ctx.textAlign = 'center';
             const cx = plotX0 + groupW * gi + groupW / 2;
-            ctx.fillText(String(cat), cx, plotY0 + plotH + 16);
+            ctx.fillText(String(cat), cx, plotY0 + plotH + 18);
         });
     }
 
     // ===== Legend =====
-    const legendY = padTop / 2 + 4;
+    const legendY = padTop / 2 + 8;
     let legendX = plotX0;
-    ctx.font = '11px Malgun Gothic, sans-serif';
+    ctx.font = '13px Malgun Gothic, sans-serif';
     ctx.textAlign = 'left';
     yCols.forEach((col, sIdx) => {
         const color = SERIES_COLORS[sIdx % SERIES_COLORS.length];
         const label = dt.columns[col] || ('y' + (sIdx + 1));
         const textW = ctx.measureText(label).width;
         ctx.fillStyle = color;
-        ctx.fillRect(legendX, legendY - 8, 12, 12);
+        ctx.fillRect(legendX, legendY - 10, 14, 14);
         ctx.fillStyle = '#111827';
-        ctx.fillText(label, legendX + 18, legendY + 2);
-        legendX += textW + 36;
+        ctx.fillText(label, legendX + 20, legendY + 2);
+        legendX += textW + 38;
     });
 
-    // Fit equations panel — below the plot
+    // Fit equations panel — below the x-axis label
     if (trendLabels.length) {
-        let ty = plotY0 + plotH + (type === 'bar' ? 36 : 32);
+        let ty = plotY0 + plotH + (type === 'bar' ? 72 : 68);
         const maxFit = 4;
-        ctx.font = 'bold 11px Malgun Gothic, sans-serif';
+        ctx.font = 'bold 13px Malgun Gothic, sans-serif';
         ctx.textAlign = 'left';
         trendLabels.slice(0, maxFit).forEach((l) => {
             // Small color swatch
             ctx.fillStyle = l.color;
-            ctx.fillRect(plotX0, ty - 8, 10, 10);
+            ctx.fillRect(plotX0, ty - 10, 12, 12);
             ctx.fillStyle = '#111827';
-            ctx.fillText(l.text, plotX0 + 16, ty);
-            ty += 14;
+            ctx.fillText(l.text, plotX0 + 18, ty);
+            ty += 18;
         });
         if (trendLabels.length > maxFit) {
             ctx.fillStyle = '#6b7280';
-            ctx.fillText(`(외 ${trendLabels.length - maxFit}개 추세선 생략)`, plotX0 + 16, ty);
+            ctx.fillText(`(외 ${trendLabels.length - maxFit}개 추세선 생략)`, plotX0 + 18, ty);
         }
     }
 
@@ -4883,7 +4883,7 @@ const ENGINEERING_REQUIRED = [['cover','title'],['cover','group_name'],['problem
 // =====================================================================
 
 // Render a datatable's chart to an offscreen canvas and return data-URL (or null if nothing to draw)
-function renderDataTableToImage(dt, w = 720, h = 360) {
+function renderDataTableToImage(dt, w = 720, h = 400) {
     try {
         const canvas = document.createElement('canvas');
         // Insert into DOM so prepareCanvas can measure parent width (it'll fall back to default if not)
@@ -4918,9 +4918,9 @@ function dtToDocxBlocks(dt, sectionTitle) {
     }
     // Chart image
     if (dt.chart && dt.chart.type !== 'none' && hasAnyContent) {
-        const imgURL = renderDataTableToImage(dt, 720, 360);
+        const imgURL = renderDataTableToImage(dt, 720, 400);
         if (imgURL) {
-            const img = mImg(imgURL, 480, 240);
+            const img = mImg(imgURL, 480, 267);
             if (img) {
                 blocks.push(img); // mImg already returns a centered Paragraph
                 if (dt.chart.title) {
