@@ -164,7 +164,18 @@
     background: #fffbe6;
   }
   textarea.cell { resize: vertical; min-height: 32px; line-height: 1.4; }
+  textarea.cell.autogrow { resize: none; overflow: hidden; min-height: 38px; }
   textarea.big { min-height: 100px; }
+  /* ImageList */
+  .imagelist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; margin-bottom: 10px; }
+  .imagelist-item { border: 1px solid #d1d5db; border-radius: 8px; overflow: hidden; background: #fff; }
+  .imagelist-item img { width: 100%; display: block; max-height: 240px; object-fit: contain; background: #f8fafc; }
+  .imagelist-item-bar { display: flex; justify-content: space-between; align-items: center; padding: 4px 8px; font-size: 12px; color: #475569; background: #f1f5f9; }
+  .imagelist-item-bar button { border: none; background: transparent; cursor: pointer; font-size: 13px; padding: 2px 5px; border-radius: 4px; }
+  .imagelist-item-bar button:hover { background: #e2e8f0; }
+  .imagelist-add { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; padding: 16px; border: 2px dashed #cbd5e1; border-radius: 8px; cursor: pointer; color: #64748b; font-size: 13px; transition: all .15s; }
+  .imagelist-add:hover { border-color: var(--primary); background: #f8fafc; color: var(--primary); }
+  .imagelist-add input { display: none; }
   textarea.huge { min-height: 160px; }
 
   input.cell[type=number] { text-align: center; }
@@ -1357,12 +1368,38 @@ function TextInput({ value, onChange, placeholder, type = 'text' }) {
     return (React.createElement("input", { className: "cell", type: type, value: value || '', onChange: (e) => onChange(e.target.value), placeholder: placeholder || '' }));
 }
 function TextArea({ value, onChange, placeholder, big, huge }) {
-    let cls = 'cell';
+    const ref = useRef(null);
+    let cls = 'cell autogrow';
     if (huge)
         cls += ' huge';
     else if (big)
         cls += ' big';
-    return (React.createElement("textarea", { className: cls, value: value || '', onChange: (e) => onChange(e.target.value), placeholder: placeholder || '' }));
+    // Auto-grow: resize the textarea to fit its content so text never gets clipped.
+    const resize = useCallback(() => {
+        const el = ref.current;
+        if (!el) return;
+        el.style.height = 'auto';
+        el.style.height = (el.scrollHeight + 2) + 'px';
+    }, []);
+    useEffect(() => { resize(); }, [value, resize]);
+    // Resize on mount and when the element becomes visible (section switch)
+    useEffect(() => {
+        resize();
+        const el = ref.current;
+        if (!el) return;
+        // Re-measure shortly after mount in case fonts/layout settle late
+        const t = setTimeout(resize, 50);
+        return () => clearTimeout(t);
+    }, [resize]);
+    return (React.createElement("textarea", {
+        ref: ref,
+        className: cls,
+        value: value || '',
+        onChange: (e) => { onChange(e.target.value); resize(); },
+        onInput: resize,
+        placeholder: placeholder || '',
+        rows: 1
+    }));
 }
 function Hint({ children }) {
     return React.createElement("div", { className: "hint" },
@@ -1374,18 +1411,54 @@ function BulletH({ children }) {
         "\u25B6 ",
         children);
 }
+// Convert any image file to a PNG data URL via canvas (universal docx compatibility).
+// Falls back to the raw data URL if canvas conversion fails.
+function fileToPngDataURL(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const raw = ev.target.result;
+            const img = new Image();
+            img.onload = () => {
+                try {
+                    // Cap very large images to keep DB/file size reasonable.
+                    const MAX = 1600;
+                    let { width, height } = img;
+                    if (width > MAX || height > MAX) {
+                        const scale = Math.min(MAX / width, MAX / height);
+                        width = Math.round(width * scale);
+                        height = Math.round(height * scale);
+                    }
+                    const canvas = document.createElement('canvas');
+                    canvas.width = width; canvas.height = height;
+                    const ctx = canvas.getContext('2d');
+                    // White background so transparent PNGs/WEBP don't turn black in some viewers
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillRect(0, 0, width, height);
+                    ctx.drawImage(img, 0, 0, width, height);
+                    resolve(canvas.toDataURL('image/png'));
+                } catch (e) {
+                    resolve(raw); // fall back to original
+                }
+            };
+            img.onerror = () => resolve(raw);
+            img.src = raw;
+        };
+        reader.onerror = () => reject(new Error('파일을 읽을 수 없습니다.'));
+        reader.readAsDataURL(file);
+    });
+}
+
 function ImageUpload({ value, onChange, label }) {
     const handleFile = (e) => {
         const file = e.target.files[0];
         if (!file)
             return;
-        if (file.size > 5 * 1024 * 1024) {
-            alert('이미지 파일은 5MB 이하여야 합니다.');
+        if (file.size > 8 * 1024 * 1024) {
+            alert('이미지 파일은 8MB 이하여야 합니다.');
             return;
         }
-        const reader = new FileReader();
-        reader.onload = (ev) => onChange(ev.target.result);
-        reader.readAsDataURL(file);
+        fileToPngDataURL(file).then(onChange).catch(err => alert(err.message));
     };
     return (React.createElement("label", { className: "img-upload" },
         value ? (React.createElement(React.Fragment, null,
@@ -2872,8 +2945,25 @@ function mImg(dataURL, w = 400, h = 280) {
     if (!bytes)
         return null;
     const { ImageRun, Paragraph, AlignmentType } = D();
+    // Detect image type from the data URL header so docx embeds it with the right extension.
+    let type = 'png';
+    try {
+        const m = /^data:image\/([a-zA-Z0-9.+-]+)/.exec(dataURL || '');
+        if (m) {
+            let t = m[1].toLowerCase();
+            if (t === 'jpeg' || t === 'jpg') type = 'jpg';
+            else if (t === 'png') type = 'png';
+            else if (t === 'gif') type = 'gif';
+            else if (t === 'bmp') type = 'bmp';
+            else if (t === 'svg+xml' || t === 'svg') type = 'svg';
+            else type = 'png'; // webp/heic/etc → re-label as png; browsers decode the bytes fine
+        }
+    } catch (e) { /* default png */ }
+    const imgOpts = { data: bytes, type, transformation: { width: w, height: h } };
+    // SVG requires a raster fallback in docx-js; skip type for svg to avoid errors.
+    if (type === 'svg') { delete imgOpts.type; }
     return new Paragraph({
-        children: [new ImageRun({ data: bytes, transformation: { width: w, height: h } })],
+        children: [new ImageRun(imgOpts)],
         alignment: AlignmentType.CENTER,
     });
 }
@@ -3306,6 +3396,156 @@ function NumberedList({ items, onChange, label, minRows = 3 }) {
                 onClick: addRow,
                 style: { fontSize: 12 }
             }, '+ 행 추가')));
+}
+
+// =====================================================================
+// IMAGE LIST — attach multiple images (png/jpg/gif/webp...), inline preview,
+// deletable; stored as array of data-URLs so they export into docx.
+// =====================================================================
+function ImageList({ items, onChange, max = 8 }) {
+    const list = Array.isArray(items) ? items : [];
+    const addFiles = (fileList) => {
+        const files = Array.from(fileList || []);
+        if (!files.length) return;
+        const room = max - list.length;
+        if (room <= 0) { alert(`이미지는 최대 ${max}장까지 첨부할 수 있습니다.`); return; }
+        const toAdd = files.slice(0, room);
+        // Convert each to PNG (universal docx compatibility), preserving order.
+        const tasks = toAdd.map(file => {
+            if (!file.type || !file.type.startsWith('image/')) return Promise.resolve(null);
+            if (file.size > 8 * 1024 * 1024) {
+                alert(`'${file.name}' 은(는) 8MB를 넘어 첨부할 수 없습니다.`);
+                return Promise.resolve(null);
+            }
+            return fileToPngDataURL(file).catch(() => null);
+        });
+        Promise.all(tasks).then(results => {
+            const valid = results.filter(Boolean);
+            if (valid.length) onChange([...list, ...valid]);
+        });
+    };
+    const removeAt = (i) => {
+        const next = list.slice();
+        next.splice(i, 1);
+        onChange(next);
+    };
+    const moveLeft = (i) => {
+        if (i <= 0) return;
+        const next = list.slice();
+        [next[i - 1], next[i]] = [next[i], next[i - 1]];
+        onChange(next);
+    };
+
+    return React.createElement('div', { className: 'imagelist' },
+        list.length > 0 && React.createElement('div', { className: 'imagelist-grid' },
+            list.map((src, i) => React.createElement('div', { key: i, className: 'imagelist-item' },
+                React.createElement('img', { src, alt: '첨부 이미지 ' + (i + 1) }),
+                React.createElement('div', { className: 'imagelist-item-bar' },
+                    React.createElement('span', null, '그림 ', i + 1),
+                    React.createElement('span', null,
+                        i > 0 && React.createElement('button', { type: 'button', onClick: () => moveLeft(i), title: '앞으로 이동' }, '←'),
+                        React.createElement('button', { type: 'button', onClick: () => removeAt(i), title: '삭제', style: { color: '#dc2626' } }, '✕')))
+            ))),
+        React.createElement('label', { className: 'imagelist-add' },
+            React.createElement('span', { style: { fontSize: 20 } }, '＋'),
+            React.createElement('span', null, list.length ? '이미지 더 추가' : '이미지 첨부 (여러 장 선택 가능)'),
+            React.createElement('span', { style: { fontSize: 11, color: '#94a3b8' } }, 'PNG·JPG·GIF·WEBP 등 · 최대 8MB'),
+            React.createElement('input', {
+                type: 'file', accept: 'image/*', multiple: true,
+                onChange: (e) => { addFiles(e.target.files); e.target.value = ''; }
+            })));
+}
+
+// =====================================================================
+// EDITABLE ROWS TABLE — fixed columns, user adds/removes rows freely.
+// columns: [{ key, label, width?, type? ('text'|'area') }]
+// value: array of row-objects keyed by column.key
+// =====================================================================
+function EditableRowsTable({ columns, value, onChange, minRows = 1, addLabel = '+ 행 추가', rowLabel }) {
+    const rows = Array.isArray(value) && value.length ? value : Array.from({ length: minRows }, () => ({}));
+    const setCell = (ri, key, v) => {
+        const next = rows.map(r => ({ ...r }));
+        if (!next[ri]) next[ri] = {};
+        next[ri][key] = v;
+        onChange(next);
+    };
+    const addRow = () => onChange([...rows.map(r => ({ ...r })), {}]);
+    const removeRow = (ri) => {
+        const next = rows.map(r => ({ ...r }));
+        next.splice(ri, 1);
+        onChange(next.length ? next : [{}]);
+    };
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'scroll-table' },
+            React.createElement('table', { className: 'ftbl no-stack' },
+                React.createElement('thead', null,
+                    React.createElement('tr', null,
+                        rowLabel && React.createElement('th', { style: { width: 60 } }, '#'),
+                        columns.map((c, i) => React.createElement('th', { key: i, style: c.width ? { width: c.width } : null }, c.label)),
+                        React.createElement('th', { style: { width: 46 } }))),
+                React.createElement('tbody', null,
+                    rows.map((row, ri) => React.createElement('tr', { key: ri },
+                        rowLabel && React.createElement('td', { className: 'label-left' }, rowLabel, ' ', ri + 1),
+                        columns.map((c, ci) => React.createElement('td', { key: ci, 'data-label': c.label },
+                            c.type === 'text'
+                                ? React.createElement(TextInput, { value: row[c.key] || '', onChange: v => setCell(ri, c.key, v) })
+                                : React.createElement(TextArea, { value: row[c.key] || '', onChange: v => setCell(ri, c.key, v) }))),
+                        React.createElement('td', { className: 'no-stack-cell', style: { textAlign: 'center' } },
+                            React.createElement('button', {
+                                type: 'button', className: 'btn btn-secondary',
+                                onClick: () => removeRow(ri),
+                                style: { fontSize: 11, padding: '3px 7px', color: '#dc2626' },
+                                title: '이 행 삭제'
+                            }, '✕')))))) ),
+        React.createElement('div', { style: { marginTop: 6 } },
+            React.createElement('button', { type: 'button', className: 'btn btn-secondary', onClick: addRow, style: { fontSize: 12 } }, addLabel)));
+}
+
+// =====================================================================
+// LITERATURE CARDS — a list of "문헌" cards, each a vertical key→value table.
+// User can add/remove cards. Each card has 서지정보/왜 읽었는가/핵심 내용/적용할 점.
+// =====================================================================
+function LiteratureCards({ items, onChange }) {
+    const fields = [
+        { key: 'citation', label: '서지정보', hint: '저자·제목·출처(학술지/출판사)·연도·DOI/ISBN' },
+        { key: 'why', label: '왜 읽었는가', hint: '연결되는 연구 문제(RQ)와 읽은 이유' },
+        { key: 'summary', label: '핵심 내용 요약', hint: '주제와 직결되는 개념·데이터·결론 중심' },
+        { key: 'apply', label: '내 탐구에 적용할 점', hint: '이 문헌으로 방법/해석이 어떻게 구체화되었나' },
+    ];
+    const cards = Array.isArray(items) && items.length ? items : [{}];
+    const setField = (ci, key, v) => {
+        const next = cards.map(c => ({ ...c }));
+        if (!next[ci]) next[ci] = {};
+        next[ci][key] = v;
+        onChange(next);
+    };
+    const addCard = () => onChange([...cards.map(c => ({ ...c })), {}]);
+    const removeCard = (ci) => {
+        const next = cards.map(c => ({ ...c }));
+        next.splice(ci, 1);
+        onChange(next.length ? next : [{}]);
+    };
+    return React.createElement('div', null,
+        cards.map((card, ci) => React.createElement('div', { key: ci, style: { marginBottom: 16, border: '1px solid #d1d5db', borderRadius: 8, overflow: 'hidden' } },
+            React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#eef2f7', padding: '6px 12px', fontWeight: 700, color: 'var(--primary)' } },
+                React.createElement('span', null, '문헌 ', ci + 1),
+                React.createElement('button', {
+                    type: 'button', className: 'btn btn-secondary',
+                    onClick: () => removeCard(ci),
+                    style: { fontSize: 11, padding: '3px 8px', color: '#dc2626' }
+                }, '✕ 이 문헌 삭제')),
+            React.createElement('table', { className: 'ftbl' },
+                React.createElement('colgroup', null,
+                    React.createElement('col', { style: { width: '150px' } }),
+                    React.createElement('col', null)),
+                React.createElement('tbody', null,
+                    fields.map((f, fi) => React.createElement('tr', { key: fi },
+                        React.createElement('td', { className: 'label-left' },
+                            f.label,
+                            React.createElement('div', { style: { fontSize: 10, color: '#94a3b8', fontWeight: 400, marginTop: 2 } }, f.hint)),
+                        React.createElement('td', { 'data-label': f.label },
+                            React.createElement(TextArea, { value: card[f.key] || '', onChange: v => setField(ci, f.key, v) })))))))),
+        React.createElement('button', { type: 'button', className: 'btn btn-secondary', onClick: addCard, style: { fontSize: 12 } }, '+ 문헌 추가'));
 }
 
 // =====================================================================
@@ -5258,6 +5498,405 @@ async function buildEngineeringDoc(data, _chartImgs, projectName) {
 }
 
 // =====================================================================
+// 진로연계 고급화학 심화탐구 보고서 (ADV_CHEM)
+//   문헌 기반 탐구 · AI 비판적 활용
+// =====================================================================
+const ADV_CHEM_EMPTY_DATA = {
+    cover: { title: '', subtitle: '― 문헌 기반 탐구 · AI 비판적 활용 ―', student_id: '', name: '', career_field: '', submit_date: '' },
+    // Ⅰ. 서론
+    motivation: '',
+    career_link: '',
+    topic: '',
+    concept_links: [{}, {}],           // [{concept, relation}]
+    research_questions: [{}, {}, {}],  // [{q}]
+    // Ⅱ. 문헌
+    literature: [{}, {}],              // LiteratureCards
+    // Ⅲ. AI
+    ai_purpose: '',
+    ai_log: [{}, {}, {}],              // [{prompt, response, verdict, basis}]
+    ai_errors: '',
+    // Ⅳ. 탐구 설계
+    method: '',
+    data_collection: '',
+    result_derivation: '',
+    // Ⅴ. 탐구 결과
+    result_title: '',
+    result_images: [],                 // ImageList (그림·표·그래프)
+    result_datatable: emptyDataTable(2, 5),
+    result_text: '',
+    // Ⅵ. 결론
+    conclusion: '',
+    significance: '',
+    further: '',
+    // Ⅶ. 참고문헌
+    references: ['', '', ''],
+    // Ⅷ. 성찰·자기평가·윤리
+    reflection: '',
+    ethics_check: {},                  // keyed by index
+    self_eval: {},                     // keyed by area -> '상'|'중'|'하'
+};
+
+function AdvChemCoverSection({ data, set }) {
+    const c = data.cover || {};
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'cover' },
+            React.createElement('div', { className: 'small-title' }, '2025학년도 · 고급 화학 수행평가 (자유 탐구)'),
+            React.createElement('div', { style: { fontSize: 26, fontWeight: 700, color: 'var(--primary)', margin: '12px 0' } },
+                React.createElement(TextInput, { value: c.title, onChange: v => set(['cover', 'title'], v), placeholder: '진로 연계 고급 화학 심화 탐구 보고서' })),
+            React.createElement('div', { style: { fontSize: 14, color: '#6b7280' } },
+                React.createElement(TextInput, { value: c.subtitle, onChange: v => set(['cover', 'subtitle'], v) }))),
+        React.createElement('table', { className: 'ftbl' },
+            React.createElement('colgroup', null,
+                React.createElement('col', { style: { width: '140px' } }), React.createElement('col', null),
+                React.createElement('col', { style: { width: '140px' } }), React.createElement('col', null)),
+            React.createElement('tbody', null,
+                React.createElement('tr', null,
+                    React.createElement('td', { className: 'label-left' }, '학번'),
+                    React.createElement('td', { 'data-label': '학번' }, React.createElement(TextInput, { value: c.student_id, onChange: v => set(['cover', 'student_id'], v) })),
+                    React.createElement('td', { className: 'label-left' }, '성명'),
+                    React.createElement('td', { 'data-label': '성명' }, React.createElement(TextInput, { value: c.name, onChange: v => set(['cover', 'name'], v) }))),
+                React.createElement('tr', null,
+                    React.createElement('td', { className: 'label-left' }, '진로 희망 분야'),
+                    React.createElement('td', { 'data-label': '진로 희망 분야' }, React.createElement(TextInput, { value: c.career_field, onChange: v => set(['cover', 'career_field'], v) })),
+                    React.createElement('td', { className: 'label-left' }, '제출일'),
+                    React.createElement('td', { 'data-label': '제출일' }, React.createElement(TextInput, { value: c.submit_date, onChange: v => set(['cover', 'submit_date'], v), placeholder: '2025-07-01' }))))),
+        React.createElement(Hint, null, '작성 흐름: 동기 → 주제 + 고급화학 개념 연결 → 연구 문제 → 읽은 문헌 → 탐구 방법 → 결과 → 결론·시사점'));
+}
+
+function AdvChemIntroSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅰ. 서론 ― 탐구 동기와 주제 설정'),
+        React.createElement(BulletH, null, '1. 탐구 동기 ― 나는 ‘무엇’에 문제(의문)를 느꼈는가?'),
+        React.createElement(Hint, null, '일상·사회·진로 현장에서 겪은 구체적 장면에서 출발하세요. 예) “전기차 배터리가 겨울에 주행거리가 급감하는 것을 보고, 온도가 반응 속도에 미치는 영향에 의문을 느꼈다.”'),
+        React.createElement(TextBlock, { value: data.motivation, onChange: v => set(['motivation'], v) }),
+        React.createElement(BulletH, null, '2. 진로 희망 분야와의 연결'),
+        React.createElement(Hint, null, '위 동기가 본인의 진로 희망 분야와 어떻게 맞닿아 있는지 한두 문장으로.'),
+        React.createElement(TextBlock, { value: data.career_link, onChange: v => set(['career_link'], v), huge: false }),
+        React.createElement(BulletH, null, '3. 탐구 주제'),
+        React.createElement(Hint, null, '① 화학 관련 ② 탐구 대상·변인이 드러날 것 ③ 의문문 금지 ④ 모호한 표현 금지 ⑤ 추상적 표현 지양 — ‘명사형 한 문장’으로.'),
+        React.createElement(TextBlock, { value: data.topic, onChange: v => set(['topic'], v), huge: false }),
+        React.createElement(BulletH, null, '4. 관련 고급 화학 단원·개념 연결 (2개 이상 필수)'),
+        React.createElement(Hint, null, '주제가 어떤 단원·개념과 닿아 있는지, 그 개념이 주제 해석에 왜 필요한지 적습니다.'),
+        React.createElement(EditableRowsTable, {
+            columns: [
+                { key: 'concept', label: '관련 단원 / 개념', width: '34%' },
+                { key: 'relation', label: '주제와 어떤 관련이 있는가 (이 개념이 왜 필요한가)' },
+            ],
+            value: data.concept_links,
+            onChange: v => set(['concept_links'], v),
+            addLabel: '+ 개념 추가',
+        }),
+        React.createElement(BulletH, null, '5. 연구 문제 (Research Question)'),
+        React.createElement(Hint, null, '주제를 ‘탐구로 답할 수 있는 구체적 질문’으로 분해합니다. 1~3개 권장.'),
+        React.createElement(EditableRowsTable, {
+            columns: [{ key: 'q', label: '연구 문제' }],
+            value: data.research_questions,
+            onChange: v => set(['research_questions'], v),
+            addLabel: '+ 연구 문제 추가',
+            rowLabel: 'Q',
+        }));
+}
+
+function AdvChemLiteratureSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅱ. 본론 1 ― 문헌 탐독을 통한 이론적 토대'),
+        React.createElement(Hint, null, '연구 문제를 풀기 위해 ‘먼저’ 읽은 책·논문을 정리합니다. 각 문헌마다 서지정보 / 왜 읽었는지 / 핵심 내용 / 적용할 점을 채웁니다. 최소 2편 이상 권장.'),
+        React.createElement(LiteratureCards, { items: data.literature, onChange: v => set(['literature'], v) }));
+}
+
+function AdvChemAISection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅲ. 본론 2 ― AI 도구 활용 및 비판적 검증'),
+        React.createElement(Hint, null, 'AI는 1차 탐색·아이디어 정리·자료 후보 찾기 도구로 쓰되, 답을 그대로 믿지 말고 문헌·화학 원리로 반드시 검증합니다.'),
+        React.createElement(BulletH, null, '1. AI 활용 목적'),
+        React.createElement(TextBlock, { value: data.ai_purpose, onChange: v => set(['ai_purpose'], v), huge: false }),
+        React.createElement(BulletH, null, '2. AI 프롬프트 · 응답 · 검증 기록'),
+        React.createElement(Hint, null, '‘검증 결과’에는 정확/부분 오류/불완전 중 택1, ‘검증 근거’에는 어떤 문헌·원리로 확인했는지 적습니다.'),
+        React.createElement(EditableRowsTable, {
+            columns: [
+                { key: 'prompt', label: '입력한 프롬프트' },
+                { key: 'response', label: 'AI 응답 핵심 요약' },
+                { key: 'verdict', label: '검증 결과', width: '12%' },
+                { key: 'basis', label: '검증 근거 (문헌·원리)' },
+            ],
+            value: data.ai_log,
+            onChange: v => set(['ai_log'], v),
+            addLabel: '+ 기록 추가',
+            rowLabel: 'No',
+        }),
+        React.createElement(BulletH, null, '3. AI가 제공한 정보의 오류·한계 발견 사례'),
+        React.createElement(Hint, null, 'AI 답변에서 발견한 사실 오류·과장·근거 부족·맥락 누락 등을 구체적으로 적고, 어떻게 바로잡았는지 서술합니다.'),
+        React.createElement(TextBlock, { value: data.ai_errors, onChange: v => set(['ai_errors'], v) }));
+}
+
+function AdvChemDesignSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅳ. 본론 3 ― 탐구 설계 및 수행'),
+        React.createElement(Hint, null, 'Ⅱ의 문헌에서 얻은 근거를 바탕으로 탐구 방법을 구체화합니다. 문헌이 방법 선택의 이유가 되도록 연결하세요.'),
+        React.createElement(BulletH, null, '1. 탐구 방법'),
+        React.createElement(Hint, null, '조사/실험/관찰/설문/모델링·시뮬레이션/계산 중 무엇을 선택했는지와, 그 방법을 택한 이유(어느 문헌이 근거인지).'),
+        React.createElement(TextBlock, { value: data.method, onChange: v => set(['method'], v) }),
+        React.createElement(BulletH, null, '2. 자료 수집 방법 및 활용 도구'),
+        React.createElement(Hint, null, '어떤 자료를, 어떤 도구·기술(실험 기구, 디지털 도구, 공개 DB, 분석 SW 등)로 수집·처리할지.'),
+        React.createElement(TextBlock, { value: data.data_collection, onChange: v => set(['data_collection'], v) }),
+        React.createElement(BulletH, null, '3. 결과·결론 도출 방식'),
+        React.createElement(Hint, null, '수집한 자료를 ‘어떤 화학적 원리·계산·비교’를 거쳐 연구 문제의 답으로 연결할지 미리 설계합니다.'),
+        React.createElement(TextBlock, { value: data.result_derivation, onChange: v => set(['result_derivation'], v) }));
+}
+
+function AdvChemResultSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅴ. 본론 4 ― 탐구 결과'),
+        React.createElement(Hint, null, '① 연구 문제에 대한 답이 될 것 ② 객관적 자료(수치·표·그래프 등)로 논리 전개 ③ 분량: 그림·표가 있으면 10줄, 없으면 12줄 이상.'),
+        React.createElement(BulletH, null, '그림·표·그래프 제목'),
+        React.createElement(TextBlock, { value: data.result_title, onChange: v => set(['result_title'], v), huge: false }),
+        React.createElement(BulletH, null, '그림·사진 첨부 (여러 장 가능)'),
+        React.createElement(Hint, null, '실험 사진, 손그림, 캡처한 그래프 등을 이미지 파일로 첨부하세요. 첨부 즉시 아래에 표시되고, docx로 받을 때도 그대로 들어갑니다.'),
+        React.createElement(ImageList, { items: data.result_images, onChange: v => set(['result_images'], v) }),
+        React.createElement(BulletH, null, '데이터 표 + 그래프 (직접 입력)'),
+        React.createElement(Hint, null, '수치 데이터를 표에 입력하면 그래프가 자동으로 그려집니다. 추세선·곡선 맞춤도 가능합니다.'),
+        React.createElement(DataTable, { value: data.result_datatable, onChange: v => set(['result_datatable'], v) }),
+        React.createElement(BulletH, null, '탐구 결과 본문 서술'),
+        React.createElement(Hint, null, '위 자료를 근거로, 화학 개념·원리를 사용해 연구 문제에 답하는 논리를 전개하세요.'),
+        React.createElement(TextBlock, { value: data.result_text, onChange: v => set(['result_text'], v) }));
+}
+
+function AdvChemConclusionSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅵ. 결론 및 논의'),
+        React.createElement(BulletH, null, '1. 연구 문제에 대한 결론'),
+        React.createElement(Hint, null, '앞서 세운 연구 문제에 대해 ‘무엇을 알아냈는가’를 명확히 정리합니다.'),
+        React.createElement(TextBlock, { value: data.conclusion, onChange: v => set(['conclusion'], v) }),
+        React.createElement(BulletH, null, '2. 과학적 의미와 사회적·진로적 가치'),
+        React.createElement(TextBlock, { value: data.significance, onChange: v => set(['significance'], v) }),
+        React.createElement(BulletH, null, '3. 새롭게 생긴 궁금증 · 후속 탐구 · 보완점'),
+        React.createElement(TextBlock, { value: data.further, onChange: v => set(['further'], v) }));
+}
+
+function AdvChemReferencesSection({ data, set }) {
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅶ. 참고문헌'),
+        React.createElement(Hint, null, 'Ⅱ·Ⅲ·Ⅴ에서 인용한 모든 책·논문·자료를 정식 형식으로 정리합니다. (예: 저자(연도). 제목. 출처/학술지, 권(호), 쪽. DOI/URL)'),
+        React.createElement(NumberedList, { items: data.references, onChange: v => set(['references'], v), label: '[참고]' }));
+}
+
+const ETHICS_ITEMS = [
+    'AI 입력창에 학번·이름·학교명 등 개인정보를 입력하지 않았다.',
+    'AI 생성물을 출처 표기 없이 그대로 옮겨 적지 않았다.',
+    '인용한 책·논문·자료의 출처를 모두 정확히 밝혔다.',
+    'AI가 제시한 정보를 문헌·원리로 비판적으로 검증하였다.',
+    '탐구 전 과정을 자기주도적으로 수행하였다.',
+];
+const SELF_EVAL_AREAS = ['주제·진로의 유기적 연결', '문헌 탐독의 충실성', 'AI의 비판적 검증', '결과·결론의 논리성', '자기주도적 태도'];
+
+function AdvChemReflectionSection({ data, set }) {
+    const ethics = data.ethics_check || {};
+    const evals = data.self_eval || {};
+    return React.createElement('div', null,
+        React.createElement('div', { className: 'h1-blue' }, 'Ⅷ. 탐구 성찰 · 자기 평가 · 연구 윤리'),
+        React.createElement(BulletH, null, '1. 탐구 성찰 ― 내가 발휘한 역량 (구체적 장면으로 서술)'),
+        React.createElement(Hint, null, '키워드 예시 ─ 문제 발견력, 자료 탐색·선별력, 비판적 사고(AI 검증), 화학 원리 적용력, 데이터 해석력, 논리적 글쓰기, 끈기·자기주도성, 협업·소통'),
+        React.createElement(TextBlock, { value: data.reflection, onChange: v => set(['reflection'], v) }),
+        React.createElement(BulletH, null, '2. 연구 윤리 점검표'),
+        React.createElement('table', { className: 'ftbl' },
+            React.createElement('colgroup', null, React.createElement('col', null), React.createElement('col', { style: { width: '90px' } })),
+            React.createElement('thead', null,
+                React.createElement('tr', null,
+                    React.createElement('th', null, '점검 항목'),
+                    React.createElement('th', null, '확인 ✔'))),
+            React.createElement('tbody', null,
+                ETHICS_ITEMS.map((item, i) => React.createElement('tr', { key: i },
+                    React.createElement('td', { 'data-label': '점검 항목', style: { textAlign: 'left' } }, item),
+                    React.createElement('td', { 'data-label': '확인', style: { textAlign: 'center' } },
+                        React.createElement('input', {
+                            type: 'checkbox',
+                            checked: !!ethics[i],
+                            onChange: e => set(['ethics_check', String(i)], e.target.checked),
+                            style: { width: 20, height: 20, cursor: 'pointer' }
+                        })))))),
+        React.createElement(BulletH, null, '3. 자기 평가'),
+        React.createElement('table', { className: 'ftbl' },
+            React.createElement('colgroup', null, React.createElement('col', null),
+                React.createElement('col', { style: { width: '70px' } }), React.createElement('col', { style: { width: '70px' } }), React.createElement('col', { style: { width: '70px' } })),
+            React.createElement('thead', null,
+                React.createElement('tr', null,
+                    React.createElement('th', null, '평가 영역'),
+                    React.createElement('th', null, '상'), React.createElement('th', null, '중'), React.createElement('th', null, '하'))),
+            React.createElement('tbody', null,
+                SELF_EVAL_AREAS.map((area, i) => React.createElement('tr', { key: i },
+                    React.createElement('td', { 'data-label': '평가 영역', style: { textAlign: 'left' } }, area),
+                    ['상', '중', '하'].map(grade => React.createElement('td', { key: grade, 'data-label': grade, style: { textAlign: 'center' } },
+                        React.createElement('input', {
+                            type: 'radio', name: 'selfeval_' + i,
+                            checked: evals[area] === grade,
+                            onChange: () => set(['self_eval', area], grade),
+                            style: { width: 18, height: 18, cursor: 'pointer' }
+                        }))))))));
+}
+
+const ADV_CHEM_SECTIONS = [
+    { id: 'cover', label: '표지', comp: AdvChemCoverSection },
+    { id: 'intro', label: 'Ⅰ. 서론', comp: AdvChemIntroSection },
+    { id: 'literature', label: 'Ⅱ. 문헌', comp: AdvChemLiteratureSection },
+    { id: 'ai', label: 'Ⅲ. AI 활용', comp: AdvChemAISection },
+    { id: 'design', label: 'Ⅳ. 탐구 설계', comp: AdvChemDesignSection },
+    { id: 'result', label: 'Ⅴ. 탐구 결과', comp: AdvChemResultSection },
+    { id: 'conclusion', label: 'Ⅵ. 결론', comp: AdvChemConclusionSection },
+    { id: 'references', label: 'Ⅶ. 참고문헌', comp: AdvChemReferencesSection },
+    { id: 'reflection', label: 'Ⅷ. 성찰·윤리', comp: AdvChemReflectionSection },
+];
+
+function computeAdvChemProgress(data) {
+    const checks = [
+        data.motivation, data.career_link, data.topic,
+        (data.concept_links || []).some(c => c.concept || c.relation),
+        (data.research_questions || []).some(q => q.q),
+        (data.literature || []).some(l => l.citation || l.summary),
+        data.ai_purpose,
+        (data.ai_log || []).some(a => a.prompt || a.response),
+        data.method, data.data_collection, data.result_derivation,
+        data.result_text, data.conclusion, data.significance,
+    ];
+    let total = checks.length, filled = 0;
+    for (const v of checks) {
+        if (v === true) filled++;
+        else if (typeof v === 'string' && v.trim().length > 3) filled++;
+    }
+    return Math.round(filled / Math.max(total, 1) * 100);
+}
+
+async function buildAdvChemDoc(data, _chartImgs, projectName) {
+    const dx = D();
+    if (!dx) throw new Error('docx 라이브러리 로드 실패');
+    const c = data.cover || {};
+    const k = [];
+
+    // Cover
+    k.push(mP(mTR(projectName || '진로 연계 고급 화학 심화 탐구 보고서', { size: 18, italics: true, color: '7F7F7F' }), { alignment: 'center', after: 100 }));
+    k.push(mP(mTR('2025학년도 · 고급 화학 수행평가 (자유 탐구)', { size: 14, color: '7F7F7F' }), { alignment: 'center', after: 200 }));
+    k.push(mP(mTR(c.title || '진로 연계 고급 화학 심화 탐구 보고서', { size: 32, bold: true, color: PRIMARY_HEX }), { alignment: 'center', after: 120 }));
+    if (c.subtitle) k.push(mP(mTR(c.subtitle, { size: 20, italics: true, color: '595959' }), { alignment: 'center', after: 360 }));
+    k.push(mT([
+        mR([mLC('학번', 1800, { left: true }), mDC(c.student_id || '', 2880), mLC('성명', 1800, { left: true }), mDC(c.name || '', 2880)]),
+        mR([mLC('진로 희망 분야', 1800, { left: true }), mDC(c.career_field || '', 2880), mLC('제출일', 1800, { left: true }), mDC(c.submit_date || '', 2880)]),
+    ]));
+    k.push(mP(mTR(''), { after: 300 }));
+
+    // Ⅰ. 서론
+    k.push(mH1('Ⅰ. 서론 ― 탐구 동기와 주제 설정'));
+    k.push(mBullet('1. 탐구 동기')); k.push(mTxt(data.motivation || ''));
+    k.push(mBullet('2. 진로 희망 분야와의 연결')); k.push(mTxt(data.career_link || ''));
+    k.push(mBullet('3. 탐구 주제')); k.push(mTxt(data.topic || ''));
+    k.push(mBullet('4. 관련 고급 화학 단원·개념 연결'));
+    const cl = (data.concept_links || []).filter(r => r.concept || r.relation);
+    if (cl.length) {
+        k.push(mT([
+            mR([mHC('관련 단원 / 개념', 3000), mHC('주제와 어떤 관련이 있는가', 6360)]),
+            ...cl.map(r => mR([mDC(r.concept || '', 3000), mDC(r.relation || '', 6360)])),
+        ]));
+    }
+    k.push(mBullet('5. 연구 문제 (Research Question)'));
+    const rqs = (data.research_questions || []).filter(q => q.q);
+    if (rqs.length) {
+        k.push(mT(rqs.map((q, i) => mR([mLC('Q' + (i + 1), 1200, { left: true }), mDC(q.q || '', 8160)]))));
+    }
+
+    // Ⅱ. 문헌
+    k.push(mH1('Ⅱ. 본론 1 ― 문헌 탐독을 통한 이론적 토대'));
+    const lits = (data.literature || []).filter(l => l.citation || l.why || l.summary || l.apply);
+    lits.forEach((l, i) => {
+        k.push(mBullet('문헌 ' + (i + 1)));
+        k.push(mT([
+            mR([mLC('서지정보', 2400, { left: true }), mDC(l.citation || '', 6960)]),
+            mR([mLC('왜 읽었는가', 2400, { left: true }), mDC(l.why || '', 6960)]),
+            mR([mLC('핵심 내용 요약', 2400, { left: true }), mDC(l.summary || '', 6960)]),
+            mR([mLC('내 탐구에 적용할 점', 2400, { left: true }), mDC(l.apply || '', 6960)]),
+        ]));
+    });
+
+    // Ⅲ. AI
+    k.push(mH1('Ⅲ. 본론 2 ― AI 도구 활용 및 비판적 검증'));
+    k.push(mBullet('1. AI 활용 목적')); k.push(mTxt(data.ai_purpose || ''));
+    k.push(mBullet('2. AI 프롬프트 · 응답 · 검증 기록'));
+    const ail = (data.ai_log || []).filter(a => a.prompt || a.response || a.verdict || a.basis);
+    if (ail.length) {
+        k.push(mT([
+            mR([mHC('No', 700), mHC('입력한 프롬프트', 2700), mHC('AI 응답 핵심', 2700), mHC('검증 결과', 1260), mHC('검증 근거', 2000)]),
+            ...ail.map((a, i) => mR([mDC(String(i + 1), 700), mDC(a.prompt || '', 2700), mDC(a.response || '', 2700), mDC(a.verdict || '', 1260), mDC(a.basis || '', 2000)])),
+        ]));
+    }
+    k.push(mBullet('3. AI가 제공한 정보의 오류·한계 발견 사례')); k.push(mTxt(data.ai_errors || ''));
+
+    // Ⅳ. 탐구 설계
+    k.push(mH1('Ⅳ. 본론 3 ― 탐구 설계 및 수행'));
+    k.push(mBullet('1. 탐구 방법')); k.push(mTxt(data.method || ''));
+    k.push(mBullet('2. 자료 수집 방법 및 활용 도구')); k.push(mTxt(data.data_collection || ''));
+    k.push(mBullet('3. 결과·결론 도출 방식')); k.push(mTxt(data.result_derivation || ''));
+
+    // Ⅴ. 탐구 결과
+    k.push(mH1('Ⅴ. 본론 4 ― 탐구 결과'));
+    if (data.result_title && data.result_title.trim()) {
+        k.push(mBullet('그림·표·그래프 제목')); k.push(mTxt(data.result_title));
+    }
+    // Attached images
+    const imgs = (data.result_images || []).filter(s => s && typeof s === 'string' && s.startsWith('data:image'));
+    if (imgs.length) {
+        k.push(mBullet('첨부 그림·사진'));
+        imgs.forEach((url, i) => {
+            const img = mImg(url, 440, 300);
+            if (img) {
+                k.push(img);
+                k.push(mP(mTR('그림 ' + (i + 1), { italics: true, color: '7F7F7F', size: 18 }), { alignment: 'center', after: 160 }));
+            }
+        });
+    }
+    // Data table + chart
+    for (const b of dtToDocxBlocks(data.result_datatable, '데이터 표 / 그래프')) k.push(b);
+    // Result text
+    k.push(mBullet('탐구 결과 본문')); k.push(mTxt(data.result_text || ''));
+
+    // Ⅵ. 결론
+    k.push(mH1('Ⅵ. 결론 및 논의'));
+    k.push(mBullet('1. 연구 문제에 대한 결론')); k.push(mTxt(data.conclusion || ''));
+    k.push(mBullet('2. 과학적 의미와 사회적·진로적 가치')); k.push(mTxt(data.significance || ''));
+    k.push(mBullet('3. 새롭게 생긴 궁금증 · 후속 탐구 · 보완점')); k.push(mTxt(data.further || ''));
+
+    // Ⅶ. 참고문헌
+    for (const b of buildReferencesDocx(data.references)) k.push(b);
+
+    // Ⅷ. 성찰
+    k.push(mH1('Ⅷ. 탐구 성찰 · 자기 평가 · 연구 윤리'));
+    k.push(mBullet('1. 탐구 성찰')); k.push(mTxt(data.reflection || ''));
+    const ethics = data.ethics_check || {};
+    k.push(mBullet('2. 연구 윤리 점검표'));
+    k.push(mT([
+        mR([mHC('점검 항목', 8000), mHC('확인', 1360)]),
+        ...ADV_CHEM_ETHICS.map((item, i) => mR([mDC(item, 8000), mDC(ethics[String(i)] ? '✔' : '', 1360)])),
+    ]));
+    const evals = data.self_eval || {};
+    k.push(mBullet('3. 자기 평가'));
+    k.push(mT([
+        mR([mHC('평가 영역', 5760), mHC('상', 1200), mHC('중', 1200), mHC('하', 1200)]),
+        ...ADV_CHEM_SELF_AREAS.map(area => mR([
+            mDC(area, 5760),
+            mDC(evals[area] === '상' ? '●' : '', 1200),
+            mDC(evals[area] === '중' ? '●' : '', 1200),
+            mDC(evals[area] === '하' ? '●' : '', 1200),
+        ])),
+    ]));
+
+    const doc = new dx.Document({
+        creator: '실험 보고서 웹앱', title: c.title || '고급 화학 심화 탐구 보고서',
+        styles: { default: { document: { run: { font: 'Malgun Gothic', size: 22 } } } },
+        sections: [{ properties: { page: { margin: { top: 1000, right: 1000, bottom: 1000, left: 1000 } } }, children: k }],
+    });
+    return await dx.Packer.toBlob(doc);
+}
+// Expose the ethics/eval arrays for the docx builder (defined where the component lives)
+const ADV_CHEM_ETHICS = ETHICS_ITEMS;
+const ADV_CHEM_SELF_AREAS = SELF_EVAL_AREAS;
+
+// =====================================================================
 // TEMPLATES REGISTRY
 // 새 맞춤 템플릿(친환경 제설제 같은)을 추가하려면 여기에 한 항목 더 추가.
 // =====================================================================
@@ -5332,6 +5971,18 @@ const TEMPLATES = {
         computeProgress: (d) => computeReportProgress(d, ENGINEERING_REQUIRED),
         buildDoc: buildEngineeringDoc,
         hasCharts: false,
+    },
+    adv_chem: {
+        label: '진로연계 고급화학 심화탐구 보고서',
+        category: '과학 실험보고서',
+        description: '문헌 기반 탐구 · AI 비판적 활용. 고급 화학 자유탐구 수행평가용.',
+        builtin: false,
+        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        sections: ADV_CHEM_SECTIONS,
+        EMPTY_DATA: ADV_CHEM_EMPTY_DATA,
+        computeProgress: computeAdvChemProgress,
+        buildDoc: buildAdvChemDoc,
+        hasCharts: true,
     },
 };
 
