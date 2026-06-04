@@ -41,6 +41,7 @@
   .topbar h1 { margin: 0; font-size: 16px; color: var(--primary); flex: 1; }
   .save-status { font-size: 13px; color: #6b7280; }
   .save-status.saved { color: #059669; }
+  .save-status.offline { color: #b45309; font-weight: 600; }
   .btn {
     border: none; cursor: pointer;
     padding: 8px 16px; border-radius: 6px;
@@ -790,6 +791,16 @@ async function initFirebase() {
     throw new Error('Firebase SDK 로딩 실패. 인터넷 연결 또는 학교 네트워크 차단을 확인하세요. ' + (lastErr ? lastErr.message : ''));
 }
 
+// Subscribe to Firebase's real connection state (.info/connected).
+// onChange(true|false). Returns an unsubscribe function.
+async function subscribeConnectionState(onChange) {
+    const fb = await initFirebase();
+    const connRef = fb.ref(fb.db, '.info/connected');
+    return fb.onValue(connRef, (snap) => {
+        onChange(snap.val() === true);
+    });
+}
+
 // =====================================================================
 // AUTH HELPERS
 // =====================================================================
@@ -1006,7 +1017,7 @@ async function checkGroupAccess(dataRoot, classId, groupId, isAdminUser) {
 // =====================================================================
 // DATA SYNC (realtime)
 // =====================================================================
-async function subscribeToGroupData(dataRoot, classId, groupId, onUpdate) {
+async function subscribeToGroupData(dataRoot, classId, groupId, onUpdate, onError) {
     const fb = await initFirebase();
     const dataRef = fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'data'));
     const unsub = fb.onValue(dataRef, (snap) => {
@@ -1014,6 +1025,7 @@ async function subscribeToGroupData(dataRoot, classId, groupId, onUpdate) {
         onUpdate(val || null);
     }, (err) => {
         console.error('subscribeToGroupData error:', err);
+        if (onError) onError(err);
     });
     return unsub;
 }
@@ -6767,11 +6779,37 @@ function CollabApp({ user, isAdminUser, project, klass, group, onExit }) {
     const [showPwSet, setShowPwSet] = useState(false);
     const [hasPassword, setHasPassword] = useState(null);
 
-    const pendingWrites = useRef(new Map());
-    const writeTimers = useRef(new Map());
+    const pendingWrites = useRef(new Map());   // pathStr -> { value, ts, confirmed }
+    const writeTimers = useRef(new Map());      // pathStr -> debounce timer
+    const retryTimer = useRef(null);
     const localDataRef = useRef(template.EMPTY_DATA);
     const focusedFieldRef = useRef(null);
+    const connectedRef = useRef(true);
 
+    // Flush (or re-flush) every unconfirmed pending write to the server.
+    // Used on reconnect and as a periodic safety retry, so nothing is lost.
+    const flushPending = useCallback(async () => {
+        if (pendingWrites.current.size === 0) return;
+        const entries = Array.from(pendingWrites.current.entries());
+        for (const [pathStr, entry] of entries) {
+            if (entry.confirmed) continue;
+            const pathArr = pathStr.split('/').map(p => {
+                const n = parseInt(p, 10);
+                return (isNaN(n) || String(n) !== p) ? p : n;
+            });
+            try {
+                await writeGroupDataPath(dataRoot, klass.id, group.id, pathArr, entry.value);
+                // mark confirmed; it will be cleared when the server echo matches
+                const cur = pendingWrites.current.get(pathStr);
+                if (cur && cur.value === entry.value) cur.confirmed = true;
+            } catch (e) {
+                // leave it pending; will retry again later
+                console.warn('flush retry failed:', pathStr, e && e.message);
+            }
+        }
+    }, [dataRoot, klass.id, group.id]);
+
+    // Data subscription
     useEffect(() => {
         let unsub;
         (async () => {
@@ -6781,20 +6819,34 @@ function CollabApp({ user, isAdminUser, project, klass, group, onExit }) {
                 setHasPassword(pwSnap.exists());
                 unsub = await subscribeToGroupData(dataRoot, klass.id, group.id, (val) => {
                     let merged = deepMerge(template.EMPTY_DATA, val || {});
-                    const now = Date.now();
-                    const stale = [];
+                    // Re-apply every pending local write on top of the incoming snapshot.
+                    // IMPORTANT: pending writes are kept until the server echoes the SAME
+                    // value back (confirmed), so a slow/stale snapshot can never wipe out
+                    // what the student just typed. There is no time-based expiry.
                     pendingWrites.current.forEach((entry, pathStr) => {
-                        if (now - entry.ts > 5000) { stale.push(pathStr); return; }
                         const pathArr = pathStr.split('/').map(p => {
                             const n = parseInt(p, 10);
                             return (isNaN(n) || String(n) !== p) ? p : n;
                         });
-                        merged = update(merged, pathArr, entry.value);
+                        // Read the value the snapshot has for this path
+                        let snapVal = merged;
+                        for (const seg of pathArr) { snapVal = (snapVal == null) ? undefined : snapVal[seg]; }
+                        if (entry.confirmed && JSON.stringify(snapVal) === JSON.stringify(entry.value)) {
+                            // Server now agrees with our write — safe to drop it.
+                            pendingWrites.current.delete(pathStr);
+                        } else {
+                            // Keep our local value visible.
+                            merged = update(merged, pathArr, entry.value);
+                        }
                     });
-                    stale.forEach(p => pendingWrites.current.delete(p));
                     localDataRef.current = merged;
                     setData(merged);
-                    setSyncState('synced');
+                    if (connectedRef.current) setSyncState('synced');
+                }, (err) => {
+                    // A read error (e.g. transient permission/network) must NOT wipe the
+                    // student's current work. Just surface the status; keep local data.
+                    if (!connectedRef.current) setSyncState('offline');
+                    else setSyncState('error');
                 });
             } catch (e) {
                 console.error('Subscription failed:', e);
@@ -6803,6 +6855,47 @@ function CollabApp({ user, isAdminUser, project, klass, group, onExit }) {
         })();
         return () => { if (unsub) unsub(); };
     }, [dataRoot, klass.id, group.id]);
+
+    // Connection-state tracking: drives the status indicator + triggers a flush on reconnect.
+    useEffect(() => {
+        let unsub;
+        (async () => {
+            try {
+                unsub = await subscribeConnectionState((connected) => {
+                    connectedRef.current = connected;
+                    if (connected) {
+                        setSyncState('synced');
+                        flushPending(); // resend anything that didn't make it
+                    } else {
+                        setSyncState('offline');
+                    }
+                });
+            } catch (e) { /* ignore */ }
+        })();
+        return () => { if (unsub) unsub(); };
+    }, [flushPending]);
+
+    // Periodic safety retry: every 8s, re-send any still-unconfirmed writes.
+    useEffect(() => {
+        retryTimer.current = setInterval(() => {
+            if (connectedRef.current) flushPending();
+        }, 8000);
+        return () => { if (retryTimer.current) clearInterval(retryTimer.current); };
+    }, [flushPending]);
+
+    // Warn the student if they try to leave with unsaved (unconfirmed) edits.
+    useEffect(() => {
+        const handler = (e) => {
+            const hasUnconfirmed = Array.from(pendingWrites.current.values()).some(en => !en.confirmed);
+            if (hasUnconfirmed) {
+                e.preventDefault();
+                e.returnValue = '';
+                return '';
+            }
+        };
+        window.addEventListener('beforeunload', handler);
+        return () => window.removeEventListener('beforeunload', handler);
+    }, []);
 
     useEffect(() => {
         let unsub;
@@ -6820,22 +6913,21 @@ function CollabApp({ user, isAdminUser, project, klass, group, onExit }) {
             return newData;
         });
         const pathStr = path.join('/');
-        pendingWrites.current.set(pathStr, { value, ts: Date.now() });
+        // Mark as pending & unconfirmed. Stays until server echoes the same value.
+        pendingWrites.current.set(pathStr, { value, ts: Date.now(), confirmed: false });
         const existing = writeTimers.current.get(pathStr);
         if (existing) clearTimeout(existing);
         const timer = setTimeout(async () => {
             writeTimers.current.delete(pathStr);
             try {
                 await writeGroupDataPath(dataRoot, klass.id, group.id, path, value);
-                setTimeout(() => {
-                    const cur = pendingWrites.current.get(pathStr);
-                    if (cur && cur.value === value) {
-                        pendingWrites.current.delete(pathStr);
-                    }
-                }, 1500);
+                const cur = pendingWrites.current.get(pathStr);
+                if (cur && cur.value === value) cur.confirmed = true; // wait for echo to delete
+                if (connectedRef.current) setSyncState('synced');
             } catch (e) {
-                console.error('Write failed:', pathStr, e);
-                setSyncState('error');
+                // Keep it pending (unconfirmed); the reconnect/periodic flush will retry.
+                console.warn('Write failed, will retry:', pathStr, e && e.message);
+                if (!connectedRef.current) setSyncState('offline');
             }
         }, 350);
         writeTimers.current.set(pathStr, timer);
@@ -6917,10 +7009,11 @@ function CollabApp({ user, isAdminUser, project, klass, group, onExit }) {
                 klass.name, ' / ', group.name,
                 isAdminUser && React.createElement('span', { className: 'admin-badge' }, '관리자')
             ),
-            React.createElement('span', { className: 'save-status ' + (syncState === 'synced' ? 'saved' : '') },
+            React.createElement('span', { className: 'save-status ' + (syncState === 'synced' ? 'saved' : (syncState === 'offline' || syncState === 'error' ? 'offline' : '')) },
                 syncState === 'connecting' ? '연결 중...' :
-                    syncState === 'synced' ? `✓ 실시간 동기화${otherPresenceCount > 0 ? ` (다른 사용자 ${otherPresenceCount}명)` : ''}` :
-                        '⚠ 연결 오류'),
+                    syncState === 'synced' ? `✓ 실시간 저장 중${otherPresenceCount > 0 ? ` · 함께 작성 ${otherPresenceCount}명` : ''}` :
+                        syncState === 'offline' ? '⚠ 인터넷 끊김 — 입력 내용은 보관되며 연결되면 자동 저장됩니다' :
+                            '⚠ 연결 오류 — 입력 내용은 보관되며 재연결 시 저장됩니다'),
             (hasPassword === false || isAdminUser) && React.createElement('button', { className: 'btn btn-secondary', onClick: () => setShowPwSet(true) },
                 hasPassword ? '🔒 비밀번호 변경' : '🔒 비밀번호 설정'),
             React.createElement('button', { className: 'btn', onClick: handleDownload, disabled: downloading },
