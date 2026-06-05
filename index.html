@@ -909,9 +909,25 @@ async function deleteUserProject(projectId) {
 // CLASS / GROUP MANAGEMENT (admin only — enforced by Firebase rules)
 // All Firebase data functions take `dataRoot` as their first parameter.
 // =====================================================================
+// ---------------------------------------------------------------------
+// DATA LAYOUT (v2 — password-safe)
+//   <root>/meta/classes/$cid                = { name, createdAt }
+//   <root>/meta/groups/$cid/$gid            = { name, createdAt, hasPassword }
+//   <root>/secure/$cid/$gid/data            = worksheet content (password-gated)
+//   <root>/secure/$cid/$gid/password        = admin-read-only plaintext
+//   <root>/secure/$cid/$gid/passwordAttempts/$uid
+//   <root>/secure/$cid/$gid/presence/$uid
+// The `meta` subtree is world-readable (to signed-in users) for listing and holds
+// NO secrets. The `secure` subtree has no readable ancestor, so the per-group
+// password rule on `data` cannot be bypassed by rule cascade.
+// ---------------------------------------------------------------------
+function metaClassPath(dataRoot, classId) { return dpath(dataRoot, 'meta', 'classes', classId); }
+function metaGroupPath(dataRoot, classId, groupId) { return dpath(dataRoot, 'meta', 'groups', classId, groupId); }
+function securePath(dataRoot, classId, groupId, ...rest) { return dpath(dataRoot, 'secure', classId, groupId, ...rest); }
+
 async function listClasses(dataRoot) {
     const fb = await initFirebase();
-    const snap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes')));
+    const snap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'meta', 'classes')));
     if (!snap.exists()) return [];
     const out = [];
     snap.forEach(child => {
@@ -924,12 +940,12 @@ async function listClasses(dataRoot) {
 
 async function listGroups(dataRoot, classId) {
     const fb = await initFirebase();
-    const snap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups')));
+    const snap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'meta', 'groups', classId)));
     if (!snap.exists()) return [];
     const out = [];
     snap.forEach(child => {
         const v = child.val() || {};
-        out.push({ id: child.key, name: v.name || child.key, hasPassword: !!v.password, createdAt: v.createdAt || 0 });
+        out.push({ id: child.key, name: v.name || child.key, hasPassword: !!v.hasPassword, createdAt: v.createdAt || 0 });
     });
     out.sort((a, b) => (a.createdAt - b.createdAt) || a.name.localeCompare(b.name, 'ko'));
     return out;
@@ -937,36 +953,40 @@ async function listGroups(dataRoot, classId) {
 
 async function createClass(dataRoot, name) {
     const fb = await initFirebase();
-    const newRef = fb.push(fb.ref(fb.db, dpath(dataRoot, 'classes')));
+    const newRef = fb.push(fb.ref(fb.db, dpath(dataRoot, 'meta', 'classes')));
     await fb.set(newRef, { name, createdAt: Date.now() });
     return newRef.key;
 }
 
 async function renameClass(dataRoot, classId, name) {
     const fb = await initFirebase();
-    await fb.update(fb.ref(fb.db, dpath(dataRoot, 'classes', classId)), { name });
+    await fb.update(fb.ref(fb.db, metaClassPath(dataRoot, classId)), { name });
 }
 
 async function deleteClass(dataRoot, classId) {
     const fb = await initFirebase();
-    await fb.remove(fb.ref(fb.db, dpath(dataRoot, 'classes', classId)));
+    // Remove the class metadata, its groups' metadata, and all secure content.
+    await fb.remove(fb.ref(fb.db, metaClassPath(dataRoot, classId)));
+    await fb.remove(fb.ref(fb.db, dpath(dataRoot, 'meta', 'groups', classId)));
+    await fb.remove(fb.ref(fb.db, dpath(dataRoot, 'secure', classId)));
 }
 
 async function createGroup(dataRoot, classId, name) {
     const fb = await initFirebase();
-    const newRef = fb.push(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups')));
-    await fb.set(newRef, { name, createdAt: Date.now() });
+    const newRef = fb.push(fb.ref(fb.db, dpath(dataRoot, 'meta', 'groups', classId)));
+    await fb.set(newRef, { name, createdAt: Date.now(), hasPassword: false });
     return newRef.key;
 }
 
 async function renameGroup(dataRoot, classId, groupId, name) {
     const fb = await initFirebase();
-    await fb.update(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId)), { name });
+    await fb.update(fb.ref(fb.db, metaGroupPath(dataRoot, classId, groupId)), { name });
 }
 
 async function deleteGroup(dataRoot, classId, groupId) {
     const fb = await initFirebase();
-    await fb.remove(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId)));
+    await fb.remove(fb.ref(fb.db, metaGroupPath(dataRoot, classId, groupId)));
+    await fb.remove(fb.ref(fb.db, securePath(dataRoot, classId, groupId)));
 }
 
 // =====================================================================
@@ -974,17 +994,20 @@ async function deleteGroup(dataRoot, classId, groupId) {
 // =====================================================================
 async function setGroupPassword(dataRoot, classId, groupId, password) {
     const fb = await initFirebase();
-    const path = dpath(dataRoot, 'classes', classId, 'groups', groupId, 'password');
+    const pwPath = securePath(dataRoot, classId, groupId, 'password');
+    const flagPath = metaGroupPath(dataRoot, classId, groupId) + '/hasPassword';
     if (!password) {
-        await fb.remove(fb.ref(fb.db, path));
+        await fb.remove(fb.ref(fb.db, pwPath));
+        await fb.set(fb.ref(fb.db, flagPath), false);
     } else {
-        await fb.set(fb.ref(fb.db, path), String(password));
+        await fb.set(fb.ref(fb.db, pwPath), String(password));
+        await fb.set(fb.ref(fb.db, flagPath), true);
     }
 }
 
 async function getGroupPassword(dataRoot, classId, groupId) {
     const fb = await initFirebase();
-    const snap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'password')));
+    const snap = await fb.get(fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'password')));
     return snap.exists() ? snap.val() : null;
 }
 
@@ -992,9 +1015,9 @@ async function tryUnlockGroup(dataRoot, classId, groupId, password) {
     const fb = await initFirebase();
     const uid = fb.auth.currentUser?.uid;
     if (!uid) throw new Error('Not signed in');
-    await fb.set(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'passwordAttempts', uid)), String(password || ''));
+    await fb.set(fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'passwordAttempts', uid)), String(password || ''));
     try {
-        await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'data')));
+        await fb.get(fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'data')));
         return true;
     } catch (e) {
         return false;
@@ -1004,16 +1027,14 @@ async function tryUnlockGroup(dataRoot, classId, groupId, password) {
 async function checkGroupAccess(dataRoot, classId, groupId, isAdminUser) {
     if (isAdminUser) return 'admin';
     const fb = await initFirebase();
-    // We must NOT try to read the `password` node directly — security rules make it
-    // admin-only, so a student's read returns null/denied and would be misread as
-    // "no password". Instead, the single source of truth is whether the student can
-    // read `data`: the server rule allows it only when there is no password OR the
-    // student's cached attempt matches. If the read is denied, the group is locked.
+    // Single source of truth: can we read the secure `data` node? The server rule
+    // grants it only when there's no password OR our cached attempt matches.
+    // A denied read => locked. We never read the password node directly.
     try {
-        await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'data')));
-        return 'unlocked'; // no password, or already-correct attempt cached
+        await fb.get(fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'data')));
+        return 'unlocked';
     } catch (e) {
-        return 'locked';   // password set and not yet satisfied
+        return 'locked';
     }
 }
 
@@ -1022,7 +1043,7 @@ async function checkGroupAccess(dataRoot, classId, groupId, isAdminUser) {
 // =====================================================================
 async function subscribeToGroupData(dataRoot, classId, groupId, onUpdate, onError) {
     const fb = await initFirebase();
-    const dataRef = fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'data'));
+    const dataRef = fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'data'));
     const unsub = fb.onValue(dataRef, (snap) => {
         const val = snap.val();
         onUpdate(val || null);
@@ -1035,14 +1056,14 @@ async function subscribeToGroupData(dataRoot, classId, groupId, onUpdate, onErro
 
 async function writeGroupDataPath(dataRoot, classId, groupId, path, value) {
     const fb = await initFirebase();
-    const fullPath = dpath(dataRoot, 'classes', classId, 'groups', groupId, 'data', ...path.map(String));
+    const fullPath = securePath(dataRoot, classId, groupId, 'data', ...path.map(String));
     const fullRef = fb.ref(fb.db, fullPath);
     await fb.set(fullRef, value === undefined ? null : value);
 }
 
 async function loadGroupDataOnce(dataRoot, classId, groupId) {
     const fb = await initFirebase();
-    const snap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'data')));
+    const snap = await fb.get(fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'data')));
     return snap.exists() ? snap.val() : null;
 }
 
@@ -1053,7 +1074,7 @@ async function publishPresence(dataRoot, classId, groupId, fieldPath) {
     const fb = await initFirebase();
     const uid = fb.auth.currentUser?.uid;
     if (!uid) return;
-    const presenceRef = fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'presence', uid));
+    const presenceRef = fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'presence', uid));
     fb.onDisconnect(presenceRef).remove();
     if (fieldPath) {
         await fb.set(presenceRef, { field: fieldPath, at: Date.now() });
@@ -1064,8 +1085,75 @@ async function publishPresence(dataRoot, classId, groupId, fieldPath) {
 
 async function subscribePresence(dataRoot, classId, groupId, onUpdate) {
     const fb = await initFirebase();
-    const presenceRef = fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'presence'));
+    const presenceRef = fb.ref(fb.db, securePath(dataRoot, classId, groupId, 'presence'));
     return fb.onValue(presenceRef, (snap) => onUpdate(snap.val() || {}));
+}
+
+// =====================================================================
+// ONE-TIME MIGRATION (admin only) — moves the old layout
+//   <oldRoot>/classes/$cid/groups/$gid/{name,createdAt,data,password,passwordAttempts}
+// into the new layout
+//   <newRoot>/meta/classes/$cid, <newRoot>/meta/groups/$cid/$gid,
+//   <newRoot>/secure/$cid/$gid/{data,password,passwordAttempts}
+// Each group's content is COPIED first (awaited); only after a successful copy are
+// the old sensitive nodes (data, password) removed so another group can no longer
+// read them by the old path. Class/group name skeletons are left as harmless backup.
+// `pairs` = [{ oldRoot, newRoot }]. Returns a summary.
+// =====================================================================
+async function migrateToSecureLayout(pairs) {
+    const fb = await initFirebase();
+    const summary = { classes: 0, groups: 0, withData: 0, withPassword: 0 };
+    for (const { oldRoot, newRoot } of pairs) {
+        let oldClassesSnap;
+        try {
+            oldClassesSnap = await fb.get(fb.ref(fb.db, dpath(oldRoot, 'classes')));
+        } catch (e) { continue; } // nothing readable / nothing to migrate
+        if (!oldClassesSnap.exists()) continue;
+        const classes = oldClassesSnap.val() || {};
+        for (const cid of Object.keys(classes)) {
+            const cls = classes[cid] || {};
+            await fb.set(fb.ref(fb.db, metaClassPath(newRoot, cid)), {
+                name: cls.name || cid, createdAt: cls.createdAt || Date.now()
+            });
+            summary.classes++;
+            const groups = cls.groups || {};
+            for (const gid of Object.keys(groups)) {
+                const g = groups[gid] || {};
+                const hasPw = !!g.password;
+                await fb.set(fb.ref(fb.db, metaGroupPath(newRoot, cid, gid)), {
+                    name: g.name || gid, createdAt: g.createdAt || Date.now(), hasPassword: hasPw
+                });
+                // Copy worksheet data → new secure location, then remove old copy.
+                if (g.data !== undefined && g.data !== null) {
+                    await fb.set(fb.ref(fb.db, securePath(newRoot, cid, gid, 'data')), g.data);
+                    summary.withData++;
+                    await fb.remove(fb.ref(fb.db, dpath(oldRoot, 'classes', cid, 'groups', gid, 'data')));
+                }
+                // Copy password → new secure location, then remove old copy (closes the leak).
+                if (g.password) {
+                    await fb.set(fb.ref(fb.db, securePath(newRoot, cid, gid, 'password')), String(g.password));
+                    summary.withPassword++;
+                    await fb.remove(fb.ref(fb.db, dpath(oldRoot, 'classes', cid, 'groups', gid, 'password')));
+                }
+                if (g.passwordAttempts) {
+                    await fb.set(fb.ref(fb.db, securePath(newRoot, cid, gid, 'passwordAttempts')), g.passwordAttempts);
+                    await fb.remove(fb.ref(fb.db, dpath(oldRoot, 'classes', cid, 'groups', gid, 'passwordAttempts')));
+                }
+                summary.groups++;
+            }
+        }
+    }
+    return summary;
+}
+
+// Map a project (built-in or user) to its { oldRoot, newRoot } for migration.
+function migrationPairFor(project) {
+    if (project.templateId === 'snow_melter' || project.dataRoot === 'templates/snow_melter') {
+        // Built-in: old data and new layout share the same root prefix.
+        return { oldRoot: 'templates/snow_melter', newRoot: 'templates/snow_melter' };
+    }
+    // User project: old data lived under projects/{id}, new layout under userdata/{id}.
+    return { oldRoot: `projects/${project.id}`, newRoot: `userdata/${project.id}` };
 }
 
 
@@ -5983,7 +6071,7 @@ const TEMPLATES = {
         category: '과학 실험보고서',
         description: '일반 실험수업 전반. 중·고 보편.',
         builtin: false,
-        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        dataRootFor: (instanceId) => `userdata/${instanceId}`,
         sections: BASIC_SECTIONS,
         EMPTY_DATA: BASIC_EMPTY_DATA,
         computeProgress: (d) => computeReportProgress(d, BASIC_REQUIRED),
@@ -5995,7 +6083,7 @@ const TEMPLATES = {
         category: '과학 실험보고서',
         description: '변인 통제·가설 검증이 들어가는 실험. 고1 이상 권장.',
         builtin: false,
-        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        dataRootFor: (instanceId) => `userdata/${instanceId}`,
         sections: HYPOTHESIS_SECTIONS,
         EMPTY_DATA: HYPOTHESIS_EMPTY_DATA,
         computeProgress: (d) => computeReportProgress(d, HYPOTHESIS_REQUIRED),
@@ -6007,7 +6095,7 @@ const TEMPLATES = {
         category: '과학 실험보고서',
         description: '동아리·방과후·자유탐구 단원. 학생이 직접 설계.',
         builtin: false,
-        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        dataRootFor: (instanceId) => `userdata/${instanceId}`,
         sections: FREE_SECTIONS,
         EMPTY_DATA: FREE_EMPTY_DATA,
         computeProgress: (d) => computeReportProgress(d, FREE_REQUIRED),
@@ -6019,7 +6107,7 @@ const TEMPLATES = {
         category: '과학 실험보고서',
         description: '과제연구·R&E·영재반. 선행연구 분석 포함.',
         builtin: false,
-        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        dataRootFor: (instanceId) => `userdata/${instanceId}`,
         sections: ADVANCED_SECTIONS,
         EMPTY_DATA: ADVANCED_EMPTY_DATA,
         computeProgress: (d) => computeReportProgress(d, ADVANCED_REQUIRED),
@@ -6031,7 +6119,7 @@ const TEMPLATES = {
         category: '과학 실험보고서',
         description: 'STEAM·공학적 문제해결. 설계·제작·개선 반복.',
         builtin: false,
-        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        dataRootFor: (instanceId) => `userdata/${instanceId}`,
         sections: ENGINEERING_SECTIONS,
         EMPTY_DATA: ENGINEERING_EMPTY_DATA,
         computeProgress: (d) => computeReportProgress(d, ENGINEERING_REQUIRED),
@@ -6043,7 +6131,7 @@ const TEMPLATES = {
         category: '과학 실험보고서',
         description: '문헌 기반 탐구 · AI 비판적 활용. 고급 화학 자유탐구 수행평가용.',
         builtin: false,
-        dataRootFor: (instanceId) => `projects/${instanceId}`,
+        dataRootFor: (instanceId) => `userdata/${instanceId}`,
         sections: ADV_CHEM_SECTIONS,
         EMPTY_DATA: ADV_CHEM_EMPTY_DATA,
         computeProgress: computeAdvChemProgress,
@@ -6400,6 +6488,22 @@ function ProjectListScreen({ user, isAdminUser, onPickProject, onAdminLogin, onS
         catch (e) { alert('삭제 실패: ' + e.message); }
     };
 
+    const [migrating, setMigrating] = useState(false);
+    const handleMigrate = async () => {
+        if (!confirm('기존 자료를 새로운 안전한 구조로 복사합니다.\n\n· 기존 데이터는 그대로 보존되며(백업), 새 위치로 복사만 합니다.\n· 비밀번호 보호가 제대로 작동하도록 만드는 작업입니다.\n· 여러 번 실행해도 안전합니다.\n\n계속할까요?')) return;
+        setMigrating(true);
+        try {
+            const pairs = allProjects.map(migrationPairFor);
+            const summary = await migrateToSecureLayout(pairs);
+            alert(`마이그레이션 완료!\n\n· 반: ${summary.classes}개\n· 모둠: ${summary.groups}개\n· 작성된 자료: ${summary.withData}개\n· 비밀번호 설정된 모둠: ${summary.withPassword}개\n\n이제 비밀번호 보호가 정상 작동합니다. 시크릿 창에서 테스트해 보세요.`);
+            await reload();
+        } catch (e) {
+            alert('마이그레이션 실패: ' + e.message + '\n\n관리자로 로그인되어 있는지 확인하세요.');
+        } finally {
+            setMigrating(false);
+        }
+    };
+
     return React.createElement('div', null,
         React.createElement(UserBar, { user, isAdminUser, onAdminLogin, onSignOut }),
         React.createElement('div', { className: 'screen-container' },
@@ -6407,7 +6511,9 @@ function ProjectListScreen({ user, isAdminUser, onPickProject, onAdminLogin, onS
             React.createElement('div', { className: 'screen-subtitle' }, '진행할 프로젝트를 선택하세요.'),
 
             isAdminUser && React.createElement('div', { className: 'toolbar-row' },
-                React.createElement('button', { className: 'btn', onClick: () => setCreating(true) }, '+ 새 프로젝트 만들기')),
+                React.createElement('button', { className: 'btn', onClick: () => setCreating(true) }, '+ 새 프로젝트 만들기'),
+                React.createElement('button', { className: 'btn btn-secondary', onClick: handleMigrate, disabled: migrating, title: '기존 자료를 비밀번호 보호가 작동하는 새 구조로 복사합니다 (1회 실행)' },
+                    migrating ? '변환 중...' : '🔐 자료 구조 업데이트(1회)')),
 
             err && React.createElement('div', { className: 'err-msg' }, err),
 
@@ -6818,8 +6924,10 @@ function CollabApp({ user, isAdminUser, project, klass, group, onExit }) {
         (async () => {
             try {
                 const fb = await initFirebase();
-                const pwSnap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', klass.id, 'groups', group.id, 'password')));
-                setHasPassword(pwSnap.exists());
+                try {
+                    const metaSnap = await fb.get(fb.ref(fb.db, metaGroupPath(dataRoot, klass.id, group.id)));
+                    setHasPassword(!!(metaSnap.exists() && metaSnap.val() && metaSnap.val().hasPassword));
+                } catch (e) { setHasPassword(null); }
                 unsub = await subscribeToGroupData(dataRoot, klass.id, group.id, (val) => {
                     let merged = deepMerge(template.EMPTY_DATA, val || {});
                     // Re-apply every pending local write on top of the incoming snapshot.
