@@ -829,7 +829,12 @@ async function isAdmin(uid) {
     const fb = await initFirebase();
     try {
         const snap = await fb.get(fb.ref(fb.db, `admins/${uid}`));
-        return snap.exists() && snap.val() === true;
+        if (!snap.exists()) return false;
+        const v = snap.val();
+        // Accept boolean true OR the string "true" — the Firebase console often
+        // stores a manually-typed value as a string, which would otherwise fail
+        // a strict === true check and wrongly deny admin access.
+        return v === true || v === 'true' || v === 1 || v === '1';
     } catch (e) {
         console.warn('isAdmin check failed:', e);
         return false;
@@ -1102,7 +1107,7 @@ async function subscribePresence(dataRoot, classId, groupId, onUpdate) {
 // =====================================================================
 async function migrateToSecureLayout(pairs) {
     const fb = await initFirebase();
-    const summary = { classes: 0, groups: 0, withData: 0, withPassword: 0 };
+    const summary = { classes: 0, groups: 0, withData: 0, withPassword: 0, failures: [] };
     for (const { oldRoot, newRoot } of pairs) {
         let oldClassesSnap;
         try {
@@ -1112,34 +1117,49 @@ async function migrateToSecureLayout(pairs) {
         const classes = oldClassesSnap.val() || {};
         for (const cid of Object.keys(classes)) {
             const cls = classes[cid] || {};
-            await fb.set(fb.ref(fb.db, metaClassPath(newRoot, cid)), {
-                name: cls.name || cid, createdAt: cls.createdAt || Date.now()
-            });
-            summary.classes++;
+            try {
+                await fb.set(fb.ref(fb.db, metaClassPath(newRoot, cid)), {
+                    name: cls.name || cid, createdAt: cls.createdAt || Date.now()
+                });
+                summary.classes++;
+            } catch (e) {
+                summary.failures.push(`반 메타 쓰기 실패 (${cls.name || cid}): ${e && e.message}`);
+                continue;
+            }
             const groups = cls.groups || {};
             for (const gid of Object.keys(groups)) {
                 const g = groups[gid] || {};
+                const gname = g.name || gid;
                 const hasPw = !!g.password;
-                await fb.set(fb.ref(fb.db, metaGroupPath(newRoot, cid, gid)), {
-                    name: g.name || gid, createdAt: g.createdAt || Date.now(), hasPassword: hasPw
-                });
-                // Copy worksheet data → new secure location, then remove old copy.
-                if (g.data !== undefined && g.data !== null) {
-                    await fb.set(fb.ref(fb.db, securePath(newRoot, cid, gid, 'data')), g.data);
-                    summary.withData++;
-                    await fb.remove(fb.ref(fb.db, dpath(oldRoot, 'classes', cid, 'groups', gid, 'data')));
+                try {
+                    // 1) meta (name + hasPassword flag)
+                    await fb.set(fb.ref(fb.db, metaGroupPath(newRoot, cid, gid)), {
+                        name: gname, createdAt: g.createdAt || Date.now(), hasPassword: hasPw
+                    });
+                    // 2) COPY worksheet data → new secure location. NEVER delete old data
+                    //    (kept as a safe backup). Copy is idempotent.
+                    if (g.data !== undefined && g.data !== null) {
+                        await fb.set(fb.ref(fb.db, securePath(newRoot, cid, gid, 'data')), g.data);
+                        summary.withData++;
+                    }
+                    // 3) COPY password → new secure location, VERIFY it landed, then
+                    //    remove the OLD password (closes the bypass leak). Verified first
+                    //    so a password is never lost.
+                    if (g.password) {
+                        const newPwRef = fb.ref(fb.db, securePath(newRoot, cid, gid, 'password'));
+                        await fb.set(newPwRef, String(g.password));
+                        const check = await fb.get(newPwRef);
+                        if (check.exists() && String(check.val()) === String(g.password)) {
+                            summary.withPassword++;
+                            await fb.remove(fb.ref(fb.db, dpath(oldRoot, 'classes', cid, 'groups', gid, 'password')));
+                        } else {
+                            summary.failures.push(`비밀번호 복사 확인 실패 (${gname}) — 옛 비밀번호는 보존됨`);
+                        }
+                    }
+                    summary.groups++;
+                } catch (e) {
+                    summary.failures.push(`모둠 처리 실패 (${gname}): ${e && e.message}`);
                 }
-                // Copy password → new secure location, then remove old copy (closes the leak).
-                if (g.password) {
-                    await fb.set(fb.ref(fb.db, securePath(newRoot, cid, gid, 'password')), String(g.password));
-                    summary.withPassword++;
-                    await fb.remove(fb.ref(fb.db, dpath(oldRoot, 'classes', cid, 'groups', gid, 'password')));
-                }
-                if (g.passwordAttempts) {
-                    await fb.set(fb.ref(fb.db, securePath(newRoot, cid, gid, 'passwordAttempts')), g.passwordAttempts);
-                    await fb.remove(fb.ref(fb.db, dpath(oldRoot, 'classes', cid, 'groups', gid, 'passwordAttempts')));
-                }
-                summary.groups++;
             }
         }
     }
@@ -6490,15 +6510,22 @@ function ProjectListScreen({ user, isAdminUser, onPickProject, onAdminLogin, onS
 
     const [migrating, setMigrating] = useState(false);
     const handleMigrate = async () => {
-        if (!confirm('기존 자료를 새로운 안전한 구조로 복사합니다.\n\n· 기존 데이터는 그대로 보존되며(백업), 새 위치로 복사만 합니다.\n· 비밀번호 보호가 제대로 작동하도록 만드는 작업입니다.\n· 여러 번 실행해도 안전합니다.\n\n계속할까요?')) return;
+        if (!isAdminUser) { alert('관리자로 로그인한 뒤 실행하세요.'); return; }
+        if (!confirm('기존 자료를 새로운 안전한 구조로 옮깁니다.\n\n· 작성 내용·비밀번호는 새 위치로 복사된 뒤, 옛 위치에서는 정리되어 다른 모둠이 볼 수 없게 됩니다.\n· 자료가 사라지지는 않습니다(복사 성공 후에만 옛 위치 정리).\n· 여러 번 실행해도 안전합니다.\n\n계속할까요?')) return;
         setMigrating(true);
         try {
             const pairs = allProjects.map(migrationPairFor);
             const summary = await migrateToSecureLayout(pairs);
-            alert(`마이그레이션 완료!\n\n· 반: ${summary.classes}개\n· 모둠: ${summary.groups}개\n· 작성된 자료: ${summary.withData}개\n· 비밀번호 설정된 모둠: ${summary.withPassword}개\n\n이제 비밀번호 보호가 정상 작동합니다. 시크릿 창에서 테스트해 보세요.`);
+            let msg = `마이그레이션 완료!\n\n· 반: ${summary.classes}개\n· 모둠: ${summary.groups}개\n· 작성된 자료: ${summary.withData}개\n· 비밀번호 모둠: ${summary.withPassword}개`;
+            if (summary.failures && summary.failures.length) {
+                msg += `\n\n⚠ 일부 실패(${summary.failures.length}건):\n` + summary.failures.slice(0, 5).join('\n');
+            } else {
+                msg += '\n\n이제 비밀번호 보호가 정상 작동합니다. 시크릿 창에서 테스트해 보세요.';
+            }
+            alert(msg);
             await reload();
         } catch (e) {
-            alert('마이그레이션 실패: ' + e.message + '\n\n관리자로 로그인되어 있는지 확인하세요.');
+            alert('마이그레이션 오류: ' + (e && e.message ? e.message : String(e)));
         } finally {
             setMigrating(false);
         }
