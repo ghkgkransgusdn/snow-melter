@@ -1004,13 +1004,16 @@ async function tryUnlockGroup(dataRoot, classId, groupId, password) {
 async function checkGroupAccess(dataRoot, classId, groupId, isAdminUser) {
     if (isAdminUser) return 'admin';
     const fb = await initFirebase();
-    const passSnap = await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'password')));
-    if (!passSnap.exists()) return 'no-password';
+    // We must NOT try to read the `password` node directly — security rules make it
+    // admin-only, so a student's read returns null/denied and would be misread as
+    // "no password". Instead, the single source of truth is whether the student can
+    // read `data`: the server rule allows it only when there is no password OR the
+    // student's cached attempt matches. If the read is denied, the group is locked.
     try {
         await fb.get(fb.ref(fb.db, dpath(dataRoot, 'classes', classId, 'groups', groupId, 'data')));
-        return 'unlocked';
+        return 'unlocked'; // no password, or already-correct attempt cached
     } catch (e) {
-        return 'locked';
+        return 'locked';   // password set and not yet satisfied
     }
 }
 
@@ -7170,7 +7173,7 @@ function TopApp() {
             onBack: () => setRoute({ screen: 'classList', project: route.project }),
             onPickGroup: async (group) => {
                 const access = await checkGroupAccess(route.project.dataRoot, route.klass.id, group.id, isAdminUser);
-                if (access === 'admin' || access === 'no-password' || access === 'unlocked') {
+                if (access === 'admin' || access === 'unlocked') {
                     setRoute({ screen: 'worksheet', project: route.project, klass: route.klass, group });
                 } else {
                     setRoute({ screen: 'passwordPrompt', project: route.project, klass: route.klass, group });
